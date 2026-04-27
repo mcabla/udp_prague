@@ -1,0 +1,42 @@
+[package]
+name = "udp_prague"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A Rust implementation of the Prague congestion control protocol for UDP-based applications."
+readme = "README.md"
+homepage = "https://github.com/mcabla/udp_prague_rust"
+documentation = "https://docs.rs/udp_prague"
+repository = "https://github.com/mcabla/udp_prague_rust"
+keywords = ["udp", "l4s", "ecn", "networking", "congestion-control"]
+categories = ["network-programming"]
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["std"], optional = true }
+serde_json = { version = "1.0", default-features = false, features = ["std"], optional = true }
+
+[features]
+# The base Prague controller/runtime surface is always available.
+# `session` enables the higher-level wrapper API.
+# `demo-app` enables the reference-style CLI/reporting layer and example binaries.
+default = ["session", "demo-app"]
+session = []
+demo-app = ["dep:serde", "dep:serde_json"]
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[bin]]
+name = "udp_prague_sender"
+path = "src/bin/udp_prague_sender.rs"
+required-features = ["demo-app"]
+
+[[bin]]
+name = "udp_prague_receiver"
+path = "src/bin/udp_prague_receiver.rs"
+required-features = ["demo-app"]
