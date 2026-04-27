@@ -1,6 +1,6 @@
 # udp_prague
 
-`udp_prague` is a near-literal Rust port of the original C++ UDP Prague example project.
+`udp_prague` is a near-literal Rust port of the original [C++ UDP Prague example project](https://github.com/L4STeam/udp_prague).
 
 The core Prague congestion-control logic, packet formats, and socket/runtime pieces intentionally stay close to the C++ reference so parity work remains straightforward.
 

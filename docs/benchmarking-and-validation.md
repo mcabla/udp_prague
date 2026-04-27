@@ -1,6 +1,6 @@
 # Benchmarking And Validation
 
-Use this guide when you want to run the demo binaries, compare the Rust port against the upstream C++ reference, or reproduce the validation checks used for this crate.
+Use this guide when you want to run the demo binaries, compare the Rust port against the upstream [C++ reference](https://github.com/L4STeam/udp_prague), or reproduce the validation checks used for this crate.
 
 For API walkthroughs and embedding examples, start with [embedding-guide.md](embedding-guide.md).
 

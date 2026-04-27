@@ -1,6 +1,6 @@
 # Compatibility Notes
 
-Use this page when you need to compare the Rust port against the original C++ project or depend on older compatibility aliases.
+Use this page when you need to compare the Rust port against the original [C++ project](https://github.com/L4STeam/udp_prague) or depend on older compatibility aliases.
 
 For project overview and usage guidance, see [../README.md](../README.md) and [embedding-guide.md](embedding-guide.md).
 
