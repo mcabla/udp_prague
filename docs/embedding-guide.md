@@ -35,7 +35,7 @@ If you want the full crate surface including the demo binaries:
 udp_prague = { version = "0.1.0", default-features = false, features = ["session", "demo-app"] }
 ```
 
-If you want a git checkout instead of a published version, keep the same inline-table form and replace `version = "0.1.0"` with `git = "https://github.com/mcabla/udp_prague_rust"` or a local `path = "..."`.
+If you want a git checkout instead of a published version, keep the same inline-table form and replace `version = "0.1.0"` with `git = "https://github.com/mcabla/udp_prague.git"` or a local `path = "..."`.
 
 The default feature set currently enables `session` and `demo-app`, but explicit feature selection is usually easier to maintain in larger applications.
 

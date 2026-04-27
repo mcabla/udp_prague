@@ -52,7 +52,7 @@ If you want the full feature set, enable both optional layers explicitly:
 udp_prague = { version = "0.1.0", default-features = false, features = ["session", "demo-app"] }
 ```
 
-If you prefer an unreleased checkout, keep the same shape and replace `version = "0.1.0"` with `git = "https://github.com/mcabla/udp_prague_rust"` or a local `path = "..."`.
+If you prefer an unreleased checkout, keep the same shape and replace `version = "0.1.0"` with `git = "https://github.com/mcabla/udp_prague.git"` or a local `path = "..."`.
 
 The default feature set currently enables `session` and `demo-app` for compatibility, but production integrations are usually clearer when they declare the feature set explicitly.
 

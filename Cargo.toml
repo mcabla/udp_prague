@@ -5,9 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 description = "A Rust implementation of the Prague congestion control protocol for UDP-based applications."
 readme = "README.md"
-homepage = "https://github.com/mcabla/udp_prague_rust"
+homepage = "https://github.com/mcabla/udp_prague"
 documentation = "https://docs.rs/udp_prague"
-repository = "https://github.com/mcabla/udp_prague_rust"
+repository = "https://github.com/mcabla/udp_prague"
 keywords = ["udp", "l4s", "ecn", "networking", "congestion-control"]
 categories = ["network-programming"]
 
