@@ -4,6 +4,10 @@ use core::cmp;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use super::classic_aqm::{
+    ClassicAqmAssessment, ClassicAqmMonitor, ClassicAqmObservation, ClassicAqmState,
+};
+
 /// Size in bytes.
 pub type size_tp = u64;
 /// Fractional window size in µBytes (to match time in µs, for easy bytes/sec calculations).
@@ -321,9 +325,23 @@ pub struct PragueRateAdvice {
     pub virtual_rtt_us: time_tp,
     /// Approximate recent ECN pressure as parts-per-million in `[0, 1_000_000]`.
     pub ce_ratio_ppm: u32,
+    /// Raw Prague CE EWMA in parts per million. Kept as an explicit alias so
+    /// callers do not mistake the safety-clamped value for wire ECN pressure.
+    pub raw_alpha_ppm: u32,
+    /// Effective alpha after the optional Classic-AQM safety floor.
+    pub effective_alpha_ppm: u32,
+    /// Classic-AQM-derived alpha floor in parts per million.
+    pub classic_ecn_alpha_floor_ppm: u32,
+    /// Linux-reference `classic_ecn` score (scaled by 1 << 24).
+    pub classic_ecn_score: u64,
+    /// Whether the monitor currently classifies the path as Classic-compatible.
+    pub classic_ecn_fallback_active: bool,
+    /// Whether Prague's independent L4S marking negotiation/error state is active.
+    pub l4s_marking_error_active: bool,
     /// Coarse congestion summary for application adaptation logic.
     pub congestion_signal: PragueCongestionSignal,
-    /// Whether the controller has disabled L4S marking and fallen back to non-ECT.
+    /// Legacy alias for the ECN-integrity/marking-error state. Classic-AQM
+    /// compatibility is reported separately by `classic_ecn_fallback_active`.
     pub l4s_fallback_active: bool,
     /// Cumulative acknowledged packets observed by the sender-side controller.
     pub packets_received: count_tp,
@@ -336,16 +354,29 @@ pub struct PragueRateAdvice {
 impl PragueRateAdvice {
     fn new(
         state: PragueState,
+        classic: ClassicAqmAssessment,
         pacing_rate_bytes_per_sec: rate_tp,
         packet_window: count_tp,
         packet_burst: count_tp,
         packet_size_bytes: size_tp,
     ) -> Self {
+        let raw_alpha_ppm = alpha_to_ppm(state.m_alpha);
+        let effective_alpha = state.m_alpha.max(classic.alpha_floor as prob_tp);
         Self {
             pacing_rate_bytes_per_sec,
             packet_window,
             packet_burst,
             packet_size_bytes,
+            // A transient Classic-AQM-compatible response keeps ECT(1).  This
+            // follows Linux TCP-Prague's `prague_classic_ecn_fallback`: the
+            // fallback clamps alpha for coexistence with a Classic AQM; it
+            // does not change the L4S codepoint to ECT(0). See:
+            // https://github.com/L4STeam/linux/blob/testing/net/ipv4/tcp_prague.c
+            // and the supplied 6.18 comparison:
+            // https://github.com/minuscat/l4steam-6.18.y/compare/linux-6.18.y...testing-net-next39
+            // ECT(0) is reserved for an explicit administrative switch to a
+            // Classic controller. A separate ECN-integrity error may select
+            // Not-ECT, as required by the Prague safety fallback.
             next_send_ecn: if state.m_error_L4S {
                 ecn_tp::ecn_not_ect
             } else {
@@ -356,7 +387,14 @@ impl PragueRateAdvice {
             last_rtt_us: state.m_rtt,
             smoothed_rtt_us: state.m_srtt,
             virtual_rtt_us: state.m_vrtt,
-            ce_ratio_ppm: alpha_to_ppm(state.m_alpha),
+            ce_ratio_ppm: raw_alpha_ppm,
+            raw_alpha_ppm,
+            effective_alpha_ppm: alpha_to_ppm(effective_alpha),
+            classic_ecn_alpha_floor_ppm: alpha_to_ppm(classic.alpha_floor as prob_tp),
+            classic_ecn_score: classic.classic_ecn_score,
+            classic_ecn_fallback_active: classic.state == ClassicAqmState::ClassicCompatible
+                && classic.alpha_floor > 0,
+            l4s_marking_error_active: state.m_error_L4S,
             congestion_signal: congestion_signal_from_state(&state),
             l4s_fallback_active: state.m_error_L4S,
             packets_received: state.m_packets_received,
@@ -445,8 +483,11 @@ fn congestion_signal_from_state(state: &PragueState) -> PragueCongestionSignal {
 ///
 /// This is a near-literal port of the C++ `PragueCC` class. Method names intentionally
 /// match the original for easier cross-referencing.
+#[derive(Clone)]
 pub struct PragueCC {
     state: PragueState,
+    classic_aqm: ClassicAqmMonitor,
+    classic_aqm_fallback_enabled: bool,
 }
 
 impl Default for PragueCC {
@@ -482,6 +523,8 @@ impl PragueCC {
                 m_start_ref: 0,
                 ..PragueState::default()
             },
+            classic_aqm: ClassicAqmMonitor::default(),
+            classic_aqm_fallback_enabled: true,
         };
         let ts_now = cc.Now();
 
@@ -579,6 +622,61 @@ impl PragueCC {
         }
 
         cc
+    }
+
+    /// Update the maximum packet size used by the controller after a QUIC
+    /// path-MTU change or migration. The algorithm keeps its current packet
+    /// size bounded by the new maximum; all other Prague state is preserved.
+    pub fn set_max_packet_size(&mut self, max_packet_size: size_tp) {
+        self.state.m_max_packet_size = max_packet_size.max(1);
+        self.state.m_packet_size = self.state.m_packet_size.min(self.state.m_max_packet_size);
+    }
+
+    /// Enable/disable the RFC 9331 Classic-AQM response while retaining the
+    /// detector and its telemetry. Disabled mode is useful for controlled
+    /// experiments; safety-enabled profiles should leave it enabled.
+    pub fn set_classic_aqm_fallback_enabled(&mut self, enabled: bool) {
+        self.classic_aqm_fallback_enabled = enabled;
+    }
+
+    pub fn classic_aqm_fallback_enabled(&self) -> bool {
+        self.classic_aqm_fallback_enabled
+    }
+
+    pub fn observe_classic_aqm(
+        &mut self,
+        observation: ClassicAqmObservation,
+    ) -> ClassicAqmAssessment {
+        self.classic_aqm.observe(observation)
+    }
+
+    pub fn classic_aqm_assessment(&self) -> ClassicAqmAssessment {
+        self.classic_aqm.assessment()
+    }
+
+    /// Whether the adapter has a stable congestion-avoidance signal suitable
+    /// for passive AQM inference.
+    pub fn congestion_avoidance_stable(&self) -> bool {
+        self.state.m_cc_state == cs_tp::cs_cong_avoid
+    }
+
+    #[inline]
+    fn effective_alpha(&self) -> prob_tp {
+        if self.classic_aqm_fallback_enabled {
+            self.state
+                .m_alpha
+                .max(self.classic_aqm.alpha_floor() as prob_tp)
+        } else {
+            self.state.m_alpha
+        }
+    }
+
+    fn advice_assessment(&self) -> ClassicAqmAssessment {
+        let mut assessment = self.classic_aqm.assessment();
+        if !self.classic_aqm_fallback_enabled {
+            assessment.alpha_floor = 0;
+        }
+        assessment
     }
 
     /// Get a const pointer to the internal state (for logging).
@@ -902,7 +1000,7 @@ impl PragueCC {
         {
             self.state.m_rtts_to_growth =
                 (self.state.m_pacing_rate / RATE_STEP) as count_tp + (MIN_STEP as count_tp);
-            let alpha_u64 = self.state.m_alpha as u64;
+            let alpha_u64 = self.effective_alpha() as u64;
             if self.state.m_cca_mode == cca_tp::cca_prague_win {
                 self.state.m_fractional_window = self.state.m_fractional_window.wrapping_sub(
                     (self.state.m_fractional_window.wrapping_mul(alpha_u64)) >> (PROB_SHIFT + 1),
@@ -1026,6 +1124,7 @@ impl PragueCC {
         self.state.m_rtts_to_growth =
             (self.state.m_pacing_rate / RATE_STEP) as count_tp + (MIN_STEP as count_tp);
         self.state.m_lost_rtts_to_growth = 0;
+        self.classic_aqm.reset();
     }
 
     /// Get time/ECN information to attach to outgoing packets.
@@ -1113,6 +1212,7 @@ impl PragueCC {
 
         PragueRateAdvice::new(
             self.state,
+            self.advice_assessment(),
             pacing_rate,
             packet_window,
             packet_burst,
@@ -1135,6 +1235,7 @@ impl PragueCC {
         PragueVideoRateAdvice {
             transport: PragueRateAdvice::new(
                 self.state,
+                self.advice_assessment(),
                 pacing_rate,
                 self.state.m_packet_window,
                 packet_burst,
@@ -1255,6 +1356,12 @@ mod tests {
             smoothed_rtt_us: 10_000,
             virtual_rtt_us: 10_000,
             ce_ratio_ppm: 0,
+            raw_alpha_ppm: 0,
+            effective_alpha_ppm: 0,
+            classic_ecn_alpha_floor_ppm: 0,
+            classic_ecn_score: 0,
+            classic_ecn_fallback_active: false,
+            l4s_marking_error_active: false,
             congestion_signal: PragueCongestionSignal::Stable,
             l4s_fallback_active: false,
             packets_received: 0,
@@ -1405,5 +1512,49 @@ mod tests {
             cc.state.m_rtts_to_growth,
             (cc.state.m_pacing_rate / RATE_STEP) as count_tp + (MIN_STEP as count_tp)
         );
+    }
+
+    #[test]
+    fn set_max_packet_size_clamps_model_without_resetting_state() {
+        let mut cc = PragueCC::default();
+        cc.state.m_packet_size = 1500;
+        cc.state.m_max_packet_size = 1500;
+        cc.state.m_packet_window = 7;
+
+        cc.set_max_packet_size(1200);
+
+        assert_eq!(cc.state.m_max_packet_size, 1200);
+        assert_eq!(cc.state.m_packet_size, 1200);
+        assert_eq!(cc.state.m_packet_window, 7);
+
+        cc.set_max_packet_size(0);
+        assert_eq!(cc.state.m_max_packet_size, 1);
+        assert_eq!(cc.state.m_packet_size, 1);
+    }
+
+    #[test]
+    fn classic_aqm_floor_is_exposed_separately_from_raw_alpha() {
+        let mut cc = PragueCC::default();
+        for i in 0..20_000 {
+            cc.observe_classic_aqm(ClassicAqmObservation {
+                latest_rtt: std::time::Duration::from_millis(if i % 2 == 0 { 1 } else { 500 }),
+                min_rtt: std::time::Duration::from_millis(1),
+                ce_seen: true,
+                ce_delta: 1,
+                acked_delta: 10,
+                congestion_avoidance_stable: true,
+                ..Default::default()
+            });
+        }
+        cc.state.m_alpha = 0;
+        let advice = cc.bulk_advice();
+        assert!(advice.raw_alpha_ppm <= advice.effective_alpha_ppm);
+        assert!(advice.classic_ecn_score > 0);
+        assert!(advice.classic_ecn_alpha_floor_ppm > 0);
+
+        cc.set_classic_aqm_fallback_enabled(false);
+        let disabled = cc.bulk_advice();
+        assert_eq!(disabled.effective_alpha_ppm, disabled.raw_alpha_ppm);
+        assert_eq!(disabled.classic_ecn_alpha_floor_ppm, 0);
     }
 }

@@ -4,6 +4,20 @@
 
 The core Prague congestion-control logic, packet formats, and socket/runtime pieces intentionally stay close to the C++ reference so parity work remains straightforward.
 
+The reusable `congestion::ClassicAqmMonitor` is an RFC 9331 safety monitor
+for transport adapters. It consumes validated RTT/min-RTT, CE, ack-extent,
+application-limited, and congestion-avoidance observations. Its fixed-point
+score follows the L4STeam Linux `testing` branch at revision
+`c6c391a4c5b78a1bff5954e7c25406b4964f50f0`; the monitor owns its slower RTT/MDEV
+state and never changes ECN marking by itself. A safety-enabled Prague profile
+keeps ECT(1) and clamps effective alpha; ECT(0) is reserved for an explicit
+Classic controller profile.
+
+As in the Linux proof-of-concept, low-rate or high-RTT paths can be
+conservatively classified as Classic-like even when they are L4S. That safe
+false-positive direction is intentional and is exposed through the score and
+state telemetry; it is not hidden by a throughput-only shortcut.
+
 On top of that port, the crate adds optional Rust-facing session wrappers plus repository tooling for validation, parity checks, and basic measurements.
 
 Use the crate in two main ways:

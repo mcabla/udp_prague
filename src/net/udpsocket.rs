@@ -17,7 +17,7 @@ use crate::congestion::{ecn_tp, size_tp, time_tp};
 use crate::core::UdpSocketError;
 
 #[cfg(unix)]
-use core::mem;
+use core::{fmt, mem};
 
 /// Socket backend support status for the current compilation target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,10 +39,20 @@ impl SocketPlatformSupport {
 
 /// Holds a resolved socket address (IPv4 or IPv6) and its length.
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Endpoint {
     pub sa: libc::sockaddr_storage,
     pub len: libc::socklen_t,
+}
+
+#[cfg(unix)]
+impl fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("family", &self.family())
+            .field("len", &self.len)
+            .finish()
+    }
 }
 
 #[cfg(unix)]

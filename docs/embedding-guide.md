@@ -48,6 +48,34 @@ The default feature set currently enables `session` and `demo-app`, but explicit
 - `udp_prague::core` session wrappers: available with feature `session`
 - `udp_prague::demo`: reference-style app/config/reporting layer, only with feature `demo-app`
 
+### Classic-AQM safety monitor
+
+`udp_prague::congestion::ClassicAqmMonitor` is transport-neutral and can be
+embedded by native UDP or QUIC adapters. Feed it only validated, direction-
+matched recovery observations. CE is a required evidence gate; RTT variation
+alone cannot classify a path, and app-limited/unstable samples do not advance
+strong evidence. The monitor maintains the Linux Prague slow RTT/MDEV
+residuals in fixed-point arithmetic, exposes `InsufficientEvidence`,
+`L4sLikely`, `ClassicSuspected`, and `ClassicCompatible` states with sticky
+hysteresis, and resets on a genuinely new path. The source provenance is
+L4STeam/linux `testing`, revision
+`c6c391a4c5b78a1bff5954e7c25406b4964f50f0`, `net/ipv4/tcp_prague.c`
+(`prague_classic_ecn_detection` and `prague_classic_ecn_fallback`).
+
+When enabled, Prague computes `effective_alpha = max(raw_alpha,
+classic_ecn_alpha_floor)` for CE reduction. A transient Classic-compatible
+classification retains ECT(1); it does not hot-swap to CUBIC/BBR or change to
+ECT(0). Use an explicit NewReno/CUBIC profile when administrative Classic
+replacement is required. Keep one monitor per transport path and preserve it
+only when the adapter deliberately preserves the controller across a NAT
+rebinding.
+
+The detector is deliberately conservative: the RFC 9331 proof-of-concept can
+misclassify low-capacity and/or high-RTT L4S paths as Classic-like. Treat the
+score/state as experiment telemetry and report this safe false-positive
+direction when evaluating a deployment; do not replace it with a throughput-
+only classifier.
+
 ### Which API Should I Start With?
 
 If you are new to this codebase, this is the shortest decision guide:

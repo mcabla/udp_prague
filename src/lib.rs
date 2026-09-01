@@ -52,6 +52,9 @@ pub use crate::congestion::{
     PragueBitrateAction, PragueCC, PragueCongestionSignal, PragueRateAdvice, PragueState,
     PragueVideoRateAdvice, PRAGUE_INITMTU, PRAGUE_MAXRATE, PRAGUE_MINRATE,
 };
+pub use crate::congestion::{
+    ClassicAqmAssessment, ClassicAqmMonitor, ClassicAqmObservation, ClassicAqmState,
+};
 #[cfg(feature = "demo-app")]
 pub use crate::core::AppError;
 #[cfg(feature = "session")]
