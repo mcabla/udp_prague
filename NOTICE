@@ -1,0 +1,33 @@
+udp_prague
+===========
+
+This distribution contains two separately identified upstream contributions:
+
+1. The UDP Prague controller, packet formats, socket/runtime code, and the
+   demo application are adapted from L4STeam/udp_prague and are distributed
+   under Apache-2.0. The upstream project and license are available at
+   https://github.com/L4STeam/udp_prague.
+
+2. `src/congestion/classic_aqm.rs` is an adaptation of the Linux TCP-Prague
+   Classic-ECN/AQM detector and fallback equations. The corresponding Linux
+   implementations are GPL-2.0-only. This file is therefore identified as
+   GPL-2.0-only and the full license text is included at
+   `LICENSES/GPL-2.0-only.txt`.
+
+   The referenced kernel implementation carries Nokia copyright and the
+   following authors: Chia-Yu Chang, Olivier Tilmans, Koen De Schepper, and
+   Bob Briscoe. Their original GPL notice remains applicable to the adapted
+   detector.
+
+   Source references:
+   - L4STeam/linux, `testing`, `net/ipv4/tcp_prague.c`:
+     https://github.com/L4STeam/linux/blob/testing/net/ipv4/tcp_prague.c
+   - minuscat/l4steam-6.18.y, `testing-net-next39`,
+     `net/ipv4/tcp_prague.c`:
+     https://github.com/minuscat/l4steam-6.18.y/blob/testing-net-next39/net/ipv4/tcp_prague.c
+   - RFC 9331, Appendix A:
+     https://www.rfc-editor.org/rfc/rfc9331.html
+
+The package-level Cargo license expression is `Apache-2.0 AND GPL-2.0-only`.
+The GPL-covered monitor and code that incorporates it must retain the GPL
+terms; the Apache-covered portions retain the Apache-2.0 terms.

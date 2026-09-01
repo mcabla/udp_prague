@@ -1,8 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Session transport glue is adapted from the Apache-2.0 UDP Prague example
+// and integrates the GPL-2.0-only Classic-AQM monitor.
+
 use std::collections::BTreeMap;
 
 use crate::congestion::{
-    count_tp, ecn_tp, fps_tp, rate_tp, size_tp, time_tp, PragueCC, PragueRateAdvice,
-    PragueVideoRateAdvice, PRAGUE_INITRATE, PRAGUE_INITWIN, PRAGUE_MINRATE,
+    count_tp, ecn_tp, fps_tp, rate_tp, size_tp, time_tp, ClassicAqmObservation, PragueCC,
+    PragueRateAdvice, PragueState, PragueVideoRateAdvice, PRAGUE_INITRATE, PRAGUE_INITWIN,
+    PRAGUE_MINRATE,
 };
 use crate::core::SessionError;
 use crate::net::UDPSocket;
@@ -170,6 +176,7 @@ pub struct PragueVideoSenderSession {
     fps: fps_tp,
     frame_interval_us: time_tp,
     pending_frame: Option<PendingVideoFrame>,
+    min_rtt_us: time_tp,
 }
 
 /// Higher-level receiver wrapper that reassembles full RT/video frames.
@@ -235,7 +242,20 @@ impl PragueVideoSenderSession {
             fps: config.fps,
             frame_interval_us,
             pending_frame: None,
+            min_rtt_us: 0,
         })
+    }
+
+    /// Enable or disable the RFC 9331 Classic-AQM alpha floor.
+    ///
+    /// The detector remains active and visible through `advice()` either way.
+    pub fn set_classic_aqm_fallback_enabled(&mut self, enabled: bool) {
+        self.cc.set_classic_aqm_fallback_enabled(enabled);
+    }
+
+    /// Return the latest passive Classic-AQM assessment.
+    pub fn classic_aqm_assessment(&self) -> crate::congestion::ClassicAqmAssessment {
+        self.cc.classic_aqm_assessment()
     }
 
     /// Current application-facing pacing and congestion guidance for video.
@@ -592,7 +612,30 @@ impl PragueVideoSenderSession {
         self.frame_inflight = bool_as_count(self.pending_frame.is_some()) + self.sent_frames
             - self.received_frames
             - self.lost_frames;
+        let previous_state: PragueState = *self.cc.GetStatePtr();
         self.cc.PacketReceived(timestamp, echoed_timestamp);
+        let state = *self.cc.GetStatePtr();
+        if state.m_rtt > 0 {
+            let acked_delta = packets_received.wrapping_sub(previous_state.m_packets_received);
+            let ce_delta = packets_ce.wrapping_sub(previous_state.m_packets_CE);
+            let lost_delta = packets_lost.wrapping_sub(previous_state.m_packets_lost);
+            if acked_delta >= 0 && ce_delta >= 0 && lost_delta >= 0 {
+                if self.min_rtt_us <= 0 || state.m_rtt < self.min_rtt_us {
+                    self.min_rtt_us = state.m_rtt;
+                }
+                self.cc.observe_classic_aqm(ClassicAqmObservation {
+                    latest_rtt: std::time::Duration::from_micros(state.m_rtt as u64),
+                    min_rtt: std::time::Duration::from_micros(self.min_rtt_us as u64),
+                    ce_seen: ce_delta > 0,
+                    ce_delta: ce_delta as u64,
+                    acked_delta: acked_delta as u64,
+                    app_limited: self.pending_frame.is_none(),
+                    congestion_avoidance_stable: previous_state.m_cc_state
+                        == crate::congestion::cs_tp::cs_cong_avoid,
+                    ..ClassicAqmObservation::default()
+                });
+            }
+        }
         self.cc.ACKReceived(
             packets_received,
             packets_ce,
@@ -622,6 +665,7 @@ impl PragueVideoSenderSession {
     /// Reset the sender-side Prague frame state after a prolonged feedback timeout.
     pub fn on_feedback_timeout(&mut self) -> PragueVideoRateAdvice {
         self.cc.ResetCCInfo();
+        self.min_rtt_us = 0;
         self.frame_inflight = 0;
         self.inflight_packets = 0;
         self.next_send = self.cc.Now();

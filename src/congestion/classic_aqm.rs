@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-FileCopyrightText: 2024 Nokia
+//
+// Adapted for the Rust UDP Prague userspace controller from the Linux
+// TCP-Prague Classic-ECN/AQM detector. See NOTICE and LICENSES/GPL-2.0-only.txt.
+
 //! RFC 9331-compatible passive Classic-ECN/AQM monitor for Prague.
 //!
 //! The detector is intentionally kept in the canonical `udp_prague` crate.  It
@@ -41,10 +47,11 @@ const V0_LG: u64 = 160_234_941 >> V;
 const D0_LG: u64 = 183_975_331 >> D;
 
 /// State of the passive Classic-AQM detector.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClassicAqmState {
     /// No CE/RTT evidence is available yet.
+    #[default]
     InsufficientEvidence,
     /// CE has been observed but the path still looks L4S-like.
     L4sLikely,
@@ -82,12 +89,6 @@ pub struct ClassicAqmAssessment {
     pub classic_ecn_score: u64,
     /// Minimum effective Prague alpha, scaled by `1 << 20` (Prague's scale).
     pub alpha_floor: u64,
-}
-
-impl Default for ClassicAqmState {
-    fn default() -> Self {
-        Self::InsufficientEvidence
-    }
 }
 
 /// Stateful passive detector.  It is `Copy` so a Quinn path can preserve it

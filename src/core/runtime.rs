@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Runtime/reporting glue is adapted from the Apache-2.0 UDP Prague example and
+// exposes telemetry from the GPL-2.0-only Classic-AQM monitor.
+
 //! Core runtime configuration and reporting hooks.
 //!
 //! These types are part of the reusable UDP Prague library surface and are
@@ -5,7 +10,8 @@
 //! adapter in `demo::app`.
 
 use crate::congestion::{
-    count_tp, fps_tp, rate_tp, size_tp, time_tp, PRAGUE_INITMTU, PRAGUE_MAXRATE,
+    count_tp, fps_tp, rate_tp, size_tp, time_tp, ClassicAqmAssessment, PRAGUE_INITMTU,
+    PRAGUE_MAXRATE,
 };
 
 /// Default RFC8888 ACK period (µs).
@@ -44,6 +50,11 @@ pub struct RunnerConfig {
     pub rt_fps: fps_tp,
     /// Real-time frame duration (µs).
     pub rt_frameduration: u32,
+    /// Whether the RFC 9331 Classic-AQM response is enabled.
+    ///
+    /// The passive detector remains active for telemetry when this is false,
+    /// but its alpha floor is not applied to congestion response.
+    pub classic_aqm_fallback_enabled: bool,
 }
 
 impl Default for RunnerConfig {
@@ -60,6 +71,7 @@ impl Default for RunnerConfig {
             rt_mode: false,
             rt_fps: FRAME_PER_SECOND,
             rt_frameduration: FRAME_DURATION,
+            classic_aqm_fallback_enabled: true,
         }
     }
 }
@@ -184,6 +196,23 @@ pub struct PragueRecvRfc8888AckEvent<'a> {
     pub frames: PragueFrameWindowMetrics,
 }
 
+/// Sender-side Classic-AQM detector update.
+///
+/// This is emitted by the compatibility runner after a valid ACK/RFC8888
+/// extent has been observed. It lets reporters expose the safety decision
+/// without coupling the core runner to a particular logging format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PragueClassicAqmEvent {
+    pub now: time_tp,
+    pub latest_rtt_us: time_tp,
+    pub min_rtt_us: time_tp,
+    pub acked_delta: count_tp,
+    pub ce_delta: count_tp,
+    pub app_limited: bool,
+    pub congestion_avoidance_stable: bool,
+    pub assessment: ClassicAqmAssessment,
+}
+
 /// Reporting callbacks used by the sender/receiver loops.
 pub trait Reporter {
     fn LogSendData(&mut self, _event: &PragueSendDataEvent) {}
@@ -199,4 +228,6 @@ pub trait Reporter {
     fn LogRecvACK(&mut self, _event: &PragueRecvAckEvent) {}
 
     fn LogRecvRFC8888ACK(&mut self, _event: &PragueRecvRfc8888AckEvent<'_>) {}
+
+    fn LogClassicAqm(&mut self, _event: &PragueClassicAqmEvent) {}
 }

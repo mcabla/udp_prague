@@ -1,9 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::congestion::{count_tp, rate_tp, time_tp};
+use crate::congestion::{count_tp, rate_tp, time_tp, ClassicAqmState};
 use crate::core::{
-    PragueRecvAckEvent, PragueRecvDataEvent, PragueRecvRfc8888AckEvent, PragueSendAckEvent,
-    PragueSendDataEvent, PragueSendFrameDataEvent, PragueSendRfc8888AckEvent,
+    PragueClassicAqmEvent, PragueRecvAckEvent, PragueRecvDataEvent, PragueRecvRfc8888AckEvent,
+    PragueSendAckEvent, PragueSendDataEvent, PragueSendFrameDataEvent, PragueSendRfc8888AckEvent,
 };
 
 use super::AppStuff;
@@ -25,6 +25,10 @@ fn report_window_us(now: time_tp, rept_tm: time_tp, rept_int: u32) -> f32 {
 }
 
 impl AppStuff {
+    pub fn LogClassicAqm(&mut self, event: &PragueClassicAqmEvent) {
+        self.classic_aqm_assessment = event.assessment;
+    }
+
     pub(super) fn dump_json_report(&mut self) {
         if self.json_output_failed {
             return;
@@ -411,6 +415,35 @@ impl AppStuff {
             self.jw.field_i32("pkt_mark", marks_delta);
             self.jw.field_i32("pkt_lost", lost_delta);
             self.jw.field_f32("pacing_rate", rate_pacing);
+            self.jw.field_str(
+                "classic_aqm_state",
+                match self.classic_aqm_assessment.state {
+                    ClassicAqmState::InsufficientEvidence => "insufficient_evidence",
+                    ClassicAqmState::L4sLikely => "l4s_likely",
+                    ClassicAqmState::ClassicSuspected => "classic_suspected",
+                    ClassicAqmState::ClassicCompatible => "classic_compatible",
+                },
+            );
+            self.jw.field_u64(
+                "classic_ecn_score",
+                self.classic_aqm_assessment.classic_ecn_score,
+            );
+            self.jw.field_u64(
+                "classic_ecn_alpha_floor_ppm",
+                (self.classic_aqm_assessment.alpha_floor * 1_000_000) / (1 << 20),
+            );
+            self.jw.field_i32(
+                "classic_ecn_fallback_enabled",
+                i32::from(self.classic_aqm_fallback_enabled),
+            );
+            self.jw.field_i32(
+                "classic_ecn_fallback_active",
+                i32::from(
+                    self.classic_aqm_assessment.state == ClassicAqmState::ClassicCompatible
+                        && self.classic_aqm_assessment.alpha_floor > 0
+                        && self.classic_aqm_fallback_enabled,
+                ),
+            );
             if self.rt_mode {
                 self.jw.field_i32("frame_inflight", frame_inflight);
                 self.jw.field_i32("frame_window", frame_window);

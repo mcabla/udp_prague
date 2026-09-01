@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// The compatibility loops are adapted from L4STeam/udp_prague (Apache-2.0)
+// and feed the GPL-2.0-only Classic-AQM monitor documented in NOTICE.
+
 //! Sender/receiver main loops.
 //!
 //! The reference project implements its example executables as two standalone
@@ -15,14 +20,70 @@ use super::runtime::{
 };
 use super::{Reporter, RunnerConfig, RunnerError};
 use crate::congestion::{
-    count_tp, ecn_tp, fps_tp, rate_tp, size_tp, time_tp, PragueCC, PRAGUE_INITRATE, PRAGUE_INITWIN,
-    PRAGUE_MINMTU, PRAGUE_MINRATE,
+    count_tp, ecn_tp, fps_tp, rate_tp, size_tp, time_tp, ClassicAqmObservation, PragueCC,
+    PragueState, PRAGUE_INITRATE, PRAGUE_INITWIN, PRAGUE_MINMTU, PRAGUE_MINRATE,
 };
 #[cfg(feature = "demo-app")]
 use crate::demo::AppStuff;
 use crate::net::UDPSocket;
 use crate::protocol::pkt_format::*;
 use std::time::{Duration, Instant};
+
+/// Feed one accepted sender feedback extent into the passive Classic-AQM
+/// detector and publish its decision to the reporter. The detector is kept
+/// out of the wire format: it consumes only validated ACK/RTT observations.
+#[allow(clippy::too_many_arguments)]
+fn observe_classic_aqm_feedback(
+    cc: &mut PragueCC,
+    reporter: &mut dyn Reporter,
+    now: time_tp,
+    previous: PragueState,
+    packets_received: count_tp,
+    packets_ce: count_tp,
+    packets_lost: count_tp,
+    app_limited: bool,
+    min_rtt_us: &mut time_tp,
+) {
+    let state = *cc.GetStatePtr();
+    if state.m_rtt <= 0 {
+        return;
+    }
+
+    let acked_delta = packets_received.wrapping_sub(previous.m_packets_received);
+    let ce_delta = packets_ce.wrapping_sub(previous.m_packets_CE);
+    let lost_delta = packets_lost.wrapping_sub(previous.m_packets_lost);
+    // A stale/reordered feedback block must not become a huge unsigned
+    // detector extent. Prague itself rejects these counters in ACKReceived.
+    if acked_delta < 0 || ce_delta < 0 || lost_delta < 0 {
+        return;
+    }
+
+    if *min_rtt_us <= 0 || state.m_rtt < *min_rtt_us {
+        *min_rtt_us = state.m_rtt;
+    }
+
+    let assessment = cc.observe_classic_aqm(ClassicAqmObservation {
+        latest_rtt: Duration::from_micros(state.m_rtt as u64),
+        min_rtt: Duration::from_micros((*min_rtt_us).max(1) as u64),
+        ce_seen: ce_delta > 0,
+        ce_delta: ce_delta as u64,
+        acked_delta: acked_delta as u64,
+        app_limited,
+        congestion_avoidance_stable: previous.m_cc_state == crate::congestion::cs_tp::cs_cong_avoid,
+        ..ClassicAqmObservation::default()
+    });
+
+    reporter.LogClassicAqm(&super::runtime::PragueClassicAqmEvent {
+        now,
+        latest_rtt_us: state.m_rtt,
+        min_rtt_us: *min_rtt_us,
+        acked_delta,
+        ce_delta,
+        app_limited,
+        congestion_avoidance_stable: previous.m_cc_state == crate::congestion::cs_tp::cs_cong_avoid,
+        assessment,
+    });
+}
 
 /// Maximum number of consecutive timeouts before aborting.
 ///
@@ -343,6 +404,7 @@ pub fn run_sender_with_reporter(
         PRAGUE_MINRATE,
         config.max_rate,
     );
+    pragueCC.set_classic_aqm_fallback_enabled(config.classic_aqm_fallback_enabled);
 
     let mut now = pragueCC.Now();
     let mut nextSend = now;
@@ -374,6 +436,7 @@ pub fn run_sender_with_reporter(
     let mut frame_pktsent: [count_tp; FRM_BUFFER_SIZE] = [0; FRM_BUFFER_SIZE];
 
     let mut num_timeout: u8 = 0;
+    let mut min_rtt_us: time_tp = 0;
 
     // Wait for a trigger packet when not connected.
     //
@@ -585,6 +648,7 @@ pub fn run_sender_with_reporter(
             && (bytes_received as usize) >= AckMessage::SIZE
         {
             let mut ack = AckMessage::new(&mut receivebuffer[..])?;
+            let previous_state = *pragueCC.GetStatePtr();
             if !config.rt_mode {
                 ack.get_stat(&mut pkts_stat, &mut pkts_lost);
             } else {
@@ -602,6 +666,17 @@ pub fn run_sender_with_reporter(
                 frame_inflight = bool_as_count(is_sending) + sent_frame - recv_frame - lost_frame;
             }
             pragueCC.PacketReceived(ack.timestamp(), ack.echoed_timestamp());
+            observe_classic_aqm_feedback(
+                &mut pragueCC,
+                reporter,
+                now,
+                previous_state,
+                ack.packets_received(),
+                ack.packets_CE(),
+                ack.packets_lost(),
+                config.rt_mode && !is_sending,
+                &mut min_rtt_us,
+            );
             pragueCC.ACKReceived(
                 ack.packets_received(),
                 ack.packets_CE(),
@@ -651,6 +726,7 @@ pub fn run_sender_with_reporter(
         } else if bytes_received != 0 && receivebuffer[0] == RFC8888_ACK_TYPE {
             // Parse RFC8888 ACK from receivebuffer.
             let mut rfc = Rfc8888Ack::new(&mut receivebuffer[..(bytes_received as usize)])?;
+            let previous_state = *pragueCC.GetStatePtr();
             let num_rtt = if !config.rt_mode {
                 rfc.get_stat(
                     now,
@@ -686,6 +762,17 @@ pub fn run_sender_with_reporter(
 
             if num_rtt != 0 {
                 pragueCC.RFC8888Received(num_rtt as usize, &pkts_rtt);
+                observe_classic_aqm_feedback(
+                    &mut pragueCC,
+                    reporter,
+                    now,
+                    previous_state,
+                    pkts_received,
+                    pkts_CE,
+                    pkts_lost,
+                    config.rt_mode && !is_sending,
+                    &mut min_rtt_us,
+                );
                 pragueCC.ACKReceived(
                     pkts_received,
                     pkts_CE,

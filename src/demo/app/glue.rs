@@ -1,7 +1,7 @@
 use crate::core::{
-    PragueRecvAckEvent, PragueRecvDataEvent, PragueRecvRfc8888AckEvent, PragueSendAckEvent,
-    PragueSendDataEvent, PragueSendFrameDataEvent, PragueSendRfc8888AckEvent, Reporter,
-    RunnerConfig,
+    PragueClassicAqmEvent, PragueRecvAckEvent, PragueRecvDataEvent, PragueRecvRfc8888AckEvent,
+    PragueSendAckEvent, PragueSendDataEvent, PragueSendFrameDataEvent, PragueSendRfc8888AckEvent,
+    Reporter, RunnerConfig,
 };
 
 use super::AppStuff;
@@ -20,6 +20,7 @@ impl From<&AppStuff> for RunnerConfig {
             rt_mode: app.rt_mode,
             rt_fps: app.rt_fps,
             rt_frameduration: app.rt_frameduration,
+            classic_aqm_fallback_enabled: app.classic_aqm_fallback_enabled,
         }
     }
 }
@@ -51,5 +52,9 @@ impl Reporter for AppStuff {
 
     fn LogRecvRFC8888ACK(&mut self, event: &PragueRecvRfc8888AckEvent<'_>) {
         AppStuff::LogRecvRFC8888ACK(self, event);
+    }
+
+    fn LogClassicAqm(&mut self, event: &PragueClassicAqmEvent) {
+        AppStuff::LogClassicAqm(self, event);
     }
 }

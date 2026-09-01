@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0 AND GPL-2.0-only
+//
+// The base controller is adapted from L4STeam/udp_prague (Apache-2.0). Its
+// Classic-AQM integration calls the GPL-2.0-only monitor documented in NOTICE.
+
 //! Prague congestion controller (L4S Prague) — near-literal port.
 
 use core::cmp;

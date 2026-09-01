@@ -20,6 +20,17 @@ state telemetry; it is not hidden by a throughput-only shortcut.
 
 On top of that port, the crate adds optional Rust-facing session wrappers plus repository tooling for validation, parity checks, and basic measurements.
 
+The reference-style sender runner now feeds validated ACK/RTT extents into the
+Classic-AQM monitor automatically. JSON reports include the detector state,
+score, alpha floor, and whether the safety response is enabled/active. The
+controlled experiment switch `--no-classic-aqm-fallback` disables only the
+alpha floor; it leaves detector telemetry available.
+
+This package has a mixed license boundary: the original UDP Prague portions
+are Apache-2.0, while the Linux-derived Classic-AQM monitor and the code that
+integrates it are identified as GPL-2.0-only. See [NOTICE](NOTICE),
+`LICENSE`, and `LICENSES/GPL-2.0-only.txt` before redistributing it.
+
 Use the crate in two main ways:
 
 - as a reusable Rust crate for your own transport, media, or messaging code
@@ -49,24 +60,24 @@ If you want only the base Prague runtime:
 
 ```toml
 [dependencies]
-udp_prague = { version = "0.1.0", default-features = false }
+udp_prague = { version = "0.2", default-features = false }
 ```
 
 If you want the wrapper layer without the demo binaries, enable only `session`:
 
 ```toml
 [dependencies]
-udp_prague = { version = "0.1.0", default-features = false, features = ["session"] }
+udp_prague = { version = "0.2", default-features = false, features = ["session"] }
 ```
 
 If you want the full feature set, enable both optional layers explicitly:
 
 ```toml
 [dependencies]
-udp_prague = { version = "0.1.0", default-features = false, features = ["session", "demo-app"] }
+udp_prague = { version = "0.2", default-features = false, features = ["session", "demo-app"] }
 ```
 
-If you prefer an unreleased checkout, keep the same shape and replace `version = "0.1.0"` with `git = "https://github.com/mcabla/udp_prague.git"` or a local `path = "..."`.
+If you prefer an unreleased checkout, keep the same shape and replace `version = "0.2"` with `git = "https://github.com/mcabla/udp_prague.git"` or a local `path = "..."`.
 
 The default feature set currently enables `session` and `demo-app` for compatibility, but production integrations are usually clearer when they declare the feature set explicitly.
 

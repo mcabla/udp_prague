@@ -67,6 +67,18 @@ fn startup_timeout_flag_populates_runner_config() {
 }
 
 #[test]
+fn classic_aqm_fallback_can_be_disabled_from_cli() {
+    let args = vec![
+        "udp_prague_sender".to_string(),
+        "--no-classic-aqm-fallback".to_string(),
+    ];
+    let app = AppStuff::new(true, &args).expect("app args");
+
+    assert!(!app.classic_aqm_fallback_enabled);
+    assert!(!app.runner_config().classic_aqm_fallback_enabled);
+}
+
+#[test]
 fn json_dump_failure_is_latched() {
     let args = vec!["udp_prague_sender".to_string()];
     let mut app = AppStuff::new(true, &args).expect("app args");
@@ -120,6 +132,14 @@ fn sender_rt_json_report_keeps_frame_fields_and_cxx_float_format() {
     assert!(app.jw.buf.contains("\"frame_inflight\":\"1\""));
     assert!(app.jw.buf.contains("\"frame_window\":\"5\""));
     assert!(app.jw.buf.contains("\"pkt_inflight\":\"4\""));
+    assert!(app
+        .jw
+        .buf
+        .contains("\"classic_aqm_state\":\"insufficient_evidence\""));
+    assert!(app
+        .jw
+        .buf
+        .contains("\"classic_ecn_fallback_enabled\":\"1\""));
 
     let frame_pos = app.jw.buf.find("\"frame_inflight\"").expect("frame field");
     let packet_pos = app.jw.buf.find("\"pkt_inflight\"").expect("packet field");

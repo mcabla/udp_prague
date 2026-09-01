@@ -130,6 +130,9 @@ impl AppStuff {
                         .parse()
                         .map_err(|_| Self::invalid_value("RT mode frame duration"))?;
                 }
+                "--no-classic-aqm-fallback" => {
+                    self.classic_aqm_fallback_enabled = false;
+                }
                 _ => {
                     return Err(AppError::Usage(Self::usage(self.sender_role)));
                 }
@@ -191,6 +194,7 @@ impl AppStuff {
     --rfc8888ackperiod <RFC8888 ACK period, def {} us>\n\
     --rtmode (Real-Time mode)\n\
     --fps <Frame-per-second, def {} fps>\n\
+    --no-classic-aqm-fallback (disable the RFC 9331 Classic-AQM response)\n\
     --frameduration <Frame duration, def {} us>\n",
             if sender { "sender" } else { "receiver" },
             PORT,

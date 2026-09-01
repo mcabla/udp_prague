@@ -18,24 +18,24 @@ If you only want the reusable base Prague API inside another project:
 
 ```toml
 [dependencies]
-udp_prague = { version = "0.1.0", default-features = false }
+udp_prague = { version = "0.2", default-features = false }
 ```
 
 If you want the higher-level session wrappers without the demo CLI/reporting layer:
 
 ```toml
 [dependencies]
-udp_prague = { version = "0.1.0", default-features = false, features = ["session"] }
+udp_prague = { version = "0.2", default-features = false, features = ["session"] }
 ```
 
 If you want the full crate surface including the demo binaries:
 
 ```toml
 [dependencies]
-udp_prague = { version = "0.1.0", default-features = false, features = ["session", "demo-app"] }
+udp_prague = { version = "0.2", default-features = false, features = ["session", "demo-app"] }
 ```
 
-If you want a git checkout instead of a published version, keep the same inline-table form and replace `version = "0.1.0"` with `git = "https://github.com/mcabla/udp_prague.git"` or a local `path = "..."`.
+If you want a git checkout instead of a published version, keep the same inline-table form and replace `version = "0.2"` with `git = "https://github.com/mcabla/udp_prague.git"` or a local `path = "..."`.
 
 The default feature set currently enables `session` and `demo-app`, but explicit feature selection is usually easier to maintain in larger applications.
 
@@ -76,6 +76,18 @@ score/state as experiment telemetry and report this safe false-positive
 direction when evaluating a deployment; do not replace it with a throughput-
 only classifier.
 
+The compatibility sender runner feeds this monitor automatically from valid
+classic or RFC8888 feedback. The `PragueClassicAqmEvent` reporter callback
+exposes each assessment, and demo JSON reports include the current state,
+score, alpha floor, and active/enabled flags. Pass
+`--no-classic-aqm-fallback` to the demo binaries to retain telemetry while
+disabling the alpha floor for a controlled comparison.
+
+The package-level license expression is `Apache-2.0 AND GPL-2.0-only`: the
+base UDP Prague implementation follows the Apache-licensed C++ reference, and
+the Linux-derived Classic-AQM monitor/integration is GPL-covered. Preserve
+both license texts and the notices in `NOTICE` when redistributing.
+
 ### Which API Should I Start With?
 
 If you are new to this codebase, this is the shortest decision guide:
@@ -112,6 +124,10 @@ For most real applications, the best starting point is now the session wrapper l
 - `PragueVideoSenderSession` owns frame-slot timing, frame fragmentation, frame-aware ACK processing, and Prague RT header packing for video traffic.
 - `PragueVideoReceiverSession` reassembles RT frame fragments back into one complete frame payload while still sending classic ACKs per Prague packet.
 - `PragueReceiverSession` parses inbound bulk or frame packets, updates Prague receiver state, and can auto-send classic ACKs.
+
+Both sender session wrappers feed valid feedback into the Classic-AQM monitor.
+Use `classic_aqm_assessment()` to inspect the latest safety state and
+`set_classic_aqm_fallback_enabled(false)` for a telemetry-only experiment.
 
 The low-level `PragueCC` + `UDPSocket` + packet-view API is still there when you want full control over framing, delayed ACKs, RFC8888, or custom send scheduling.
 
@@ -616,7 +632,7 @@ The reference-style CLI/config/reporting layer is behind the `demo-app` feature.
 
 ```toml
 [dependencies]
-udp_prague = { version = "0.1.0", default-features = false, features = ["session", "demo-app"] }
+udp_prague = { version = "0.2", default-features = false, features = ["session", "demo-app"] }
 ```
 
 That enables:

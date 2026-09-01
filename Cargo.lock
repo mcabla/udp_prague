@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "udp_prague"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "libc",
  "serde",

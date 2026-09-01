@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// The demo layer is adapted from the Apache-2.0 UDP Prague example and reports
+// the GPL-2.0-only Classic-AQM monitor telemetry.
+
 //! Application-level utilities and CLI configuration.
 //!
 //! The C++ reference project centralizes argument parsing and logging helpers in
@@ -16,7 +21,8 @@ mod tests;
 
 use super::json_writer::json_writer;
 use crate::congestion::{
-    count_tp, fps_tp, rate_tp, size_tp, time_tp, PRAGUE_INITMTU, PRAGUE_MAXRATE,
+    count_tp, fps_tp, rate_tp, size_tp, time_tp, ClassicAqmAssessment, PRAGUE_INITMTU,
+    PRAGUE_MAXRATE,
 };
 use crate::core::{
     AppError, RunnerConfig, FRAME_DURATION, FRAME_PER_SECOND, PORT, RFC8888_ACKPERIOD,
@@ -89,6 +95,10 @@ pub struct AppStuff {
     pub rt_fps: fps_tp,
     /// Real-time frame duration (µs).
     pub rt_frameduration: u32,
+    /// Whether the RFC 9331 Classic-AQM response is enabled.
+    pub classic_aqm_fallback_enabled: bool,
+    /// Most recent sender-side Classic-AQM assessment.
+    pub classic_aqm_assessment: ClassicAqmAssessment,
 }
 
 impl AppStuff {
@@ -126,6 +136,8 @@ impl AppStuff {
             rt_mode: false,
             rt_fps: FRAME_PER_SECOND,
             rt_frameduration: FRAME_DURATION,
+            classic_aqm_fallback_enabled: true,
+            classic_aqm_assessment: ClassicAqmAssessment::default(),
         };
 
         app.parse_args(args)?;
