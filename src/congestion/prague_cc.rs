@@ -535,9 +535,15 @@ impl PragueCC {
 
         // parameters
         cc.state.m_init_rate = init_rate;
+        // Saturate instead of wrapping: a large init_window combined with a
+        // large max_packet_size (plausible at multi-gigabit rates) must not
+        // silently wrap to a small/nonsensical fractional-window value. This
+        // only affects the very first GetCCInfo() before the first ACK
+        // recomputes m_fractional_window (see ACKReceived), so saturating is
+        // a safe, behavior-preserving fix for the in-range case.
         cc.state.m_init_window = (init_window as window_tp)
-            .wrapping_mul(max_packet_size)
-            .wrapping_mul(1_000_000);
+            .saturating_mul(max_packet_size)
+            .saturating_mul(1_000_000);
         cc.state.m_min_rate = min_rate;
         cc.state.m_max_rate = max_rate;
         cc.state.m_max_packet_size = max_packet_size;
@@ -1288,6 +1294,25 @@ mod tests {
         assert_eq!(div_64_64_round(10, 3), 3); // 10 + 1 / 3 = 3
         assert_eq!(div_64_64_round(11, 3), 4); // 11 + 1 / 3 = 4
         assert_eq!(div_64_64_round(1, 0), u64::MAX);
+    }
+
+    #[test]
+    fn init_window_saturates_instead_of_wrapping_at_large_packet_sizes() {
+        // A large initial window combined with a large packet size (plausible
+        // for a multi-gigabit-per-second configuration) must saturate to
+        // u64::MAX rather than silently wrapping to a small/nonsensical
+        // value.
+        let cc = PragueCC::new(
+            u16::MAX as size_tp, // max_packet_size
+            0,                   // fps
+            0,                   // frame_budget
+            PRAGUE_INITRATE,     // init_rate
+            i32::MAX as count_tp, // init_window (Quinn's adapter clamps to this)
+            PRAGUE_MINRATE,
+            PRAGUE_MAXRATE,
+        );
+        assert_eq!(cc.state.m_init_window, window_tp::MAX);
+        assert_eq!(cc.state.m_fractional_window, window_tp::MAX);
     }
 
     #[test]
