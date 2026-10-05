@@ -495,6 +495,10 @@ pub struct PragueCC {
     classic_aqm_fallback_enabled: bool,
     /// An alpha round ended since the detector last scored.
     classic_aqm_round_due: bool,
+    /// Hold the window while the application, not the window, limits sending.
+    app_limited_hold: bool,
+    /// The sender was application-limited at the latest feedback (set by the adapter).
+    app_limited: bool,
 }
 
 impl Default for PragueCC {
@@ -533,6 +537,8 @@ impl PragueCC {
             classic_aqm: ClassicAqmMonitor::default(),
             classic_aqm_fallback_enabled: true,
             classic_aqm_round_due: false,
+            app_limited_hold: false,
+            app_limited: false,
         };
         let ts_now = cc.Now();
 
@@ -657,6 +663,46 @@ impl PragueCC {
         self.classic_aqm_fallback_enabled
     }
 
+    /// Do not grow the window or rate while the application limits sending, as Linux TCP Prague
+    /// (`prague_update_cwnd` skips growth when `tp->app_limited`) and RFC 9002 S7.8 / RFC 7661
+    /// do. Off by default: the C++ reference grows on every unmarked ACK, which suits its always
+    /// window-limited bulk sender but lets an application-limited sender's window and rate grow
+    /// without bound.
+    pub fn set_app_limited_hold(&mut self, enabled: bool) {
+        self.app_limited_hold = enabled;
+    }
+
+    /// Whether the sender is application-limited, from the adapter, before each `ACKReceived`.
+    pub fn set_app_limited(&mut self, app_limited: bool) {
+        self.app_limited = app_limited;
+    }
+
+    /// Move the window halfway toward the bytes the sender actually used, as Linux's
+    /// `tcp_cwnd_application_limited` (RFC 2861) does once per RTO for an application-limited
+    /// flow. Only in congestion avoidance and never below the minimum rate; the adapter decides
+    /// when. Returns whether the window shrank.
+    pub fn decay_toward_used(&mut self, used_bytes: u64) -> bool {
+        if self.state.m_cc_state != cs_tp::cs_cong_avoid {
+            return false;
+        }
+        let used = used_bytes.saturating_mul(1_000_000);
+        if used >= self.state.m_fractional_window {
+            return false;
+        }
+        let srtt = cmp::max(self.state.m_srtt as u64, 1);
+        let window = self.state.m_fractional_window / 2 + used / 2;
+        let rate = cmp::max(window / srtt, self.state.m_min_rate);
+        self.state.m_pacing_rate = rate;
+        self.state.m_fractional_window = if self.state.m_cca_mode == cca_tp::cca_prague_rate
+            || window / srtt < self.state.m_min_rate
+        {
+            rate.saturating_mul(srtt)
+        } else {
+            window
+        };
+        true
+    }
+
     /// Score one observation as a whole round.
     pub fn observe_classic_aqm(
         &mut self,
@@ -683,6 +729,26 @@ impl PragueCC {
 
     pub fn classic_aqm_assessment(&self) -> ClassicAqmAssessment {
         self.classic_aqm.assessment()
+    }
+
+    /// The Classic-AQM detector's RTT estimator: (srtt µs, mdev µs, gain shift).
+    pub fn classic_aqm_estimator(&self) -> (u64, u64, u32) {
+        self.classic_aqm.estimator()
+    }
+
+    /// The Classic-AQM monitor, so an adapter that rebuilds the controller on
+    /// the same path (e.g. after its own slow start) can carry the evidence over.
+    pub fn classic_aqm_monitor(&self) -> ClassicAqmMonitor {
+        self.classic_aqm
+    }
+
+    /// The classic-AQM detector's self-limitation term (`ClassicAqmMonitor::set_self_limited`).
+    pub fn set_classic_aqm_self_limited(&mut self, enabled: bool) {
+        self.classic_aqm.set_self_limited(enabled);
+    }
+
+    pub fn set_classic_aqm_monitor(&mut self, monitor: ClassicAqmMonitor) {
+        self.classic_aqm = monitor;
     }
 
     /// Whether the adapter has a stable congestion-avoidance signal suitable
@@ -977,7 +1043,8 @@ impl PragueCC {
         // Increase window if not in_loss for all the non-CE ACKs
         let acks = (packets_received.wrapping_sub(self.state.m_packets_received))
             .wrapping_sub(packets_CE.wrapping_sub(self.state.m_packets_CE));
-        if self.state.m_cc_state != cs_tp::cs_in_loss && acks > 0 {
+        let held = self.app_limited_hold && self.app_limited;
+        if self.state.m_cc_state != cs_tp::cs_in_loss && acks > 0 && !held {
             let mut increment =
                 mul_64_64_shift(self.state.m_pacing_rate, QUEUE_GROWTH as u64, 0) / 1_000_000;
             if increment < self.state.m_max_packet_size || self.state.m_rtts_to_growth != 0 {
@@ -1670,6 +1737,50 @@ mod tests {
         cc.set_max_packet_size(0);
         assert_eq!(cc.state.m_max_packet_size, 1);
         assert_eq!(cc.state.m_packet_size, 1);
+    }
+
+    #[test]
+    fn decay_moves_the_window_halfway_to_the_used_bytes() {
+        for mode in [cca_tp::cca_prague_win, cca_tp::cca_prague_rate] {
+            let mut cc = PragueCC::default();
+            cc.state.m_cc_state = cs_tp::cs_cong_avoid;
+            cc.state.m_cca_mode = mode;
+            cc.state.m_srtt = 20_000;
+            cc.state.m_fractional_window = 400_000 * 1_000_000;
+            cc.state.m_pacing_rate = 20_000_000;
+            assert!(cc.decay_toward_used(100_000));
+            assert_eq!(cc.state.m_fractional_window, 250_000 * 1_000_000);
+            assert_eq!(cc.state.m_pacing_rate, 12_500_000);
+            // At or above the used bytes, and outside congestion avoidance: untouched.
+            assert!(!cc.decay_toward_used(300_000));
+            cc.state.m_cc_state = cs_tp::cs_in_cwr;
+            assert!(!cc.decay_toward_used(100_000));
+            // Never below the minimum rate.
+            cc.state.m_cc_state = cs_tp::cs_cong_avoid;
+            assert!(cc.decay_toward_used(0));
+            assert!(cc.decay_toward_used(0));
+            for _ in 0..40 {
+                cc.decay_toward_used(0);
+            }
+            assert_eq!(cc.state.m_pacing_rate, cc.state.m_min_rate);
+            assert_eq!(cc.state.m_fractional_window, cc.state.m_min_rate * 20_000);
+        }
+    }
+
+    #[test]
+    fn app_limited_hold_stops_growth_only_while_app_limited() {
+        let grow = |hold: bool, app_limited: bool| {
+            let mut cc = idle_ack_state();
+            cc.set_app_limited_hold(hold);
+            cc.set_app_limited(app_limited);
+            let before = cc.state.m_fractional_window;
+            let mut inflight = 0;
+            assert!(cc.ACKReceived(20, 0, 0, 30, false, &mut inflight));
+            cc.state.m_fractional_window > before
+        };
+        assert!(grow(false, true), "off: grows as the C++ reference does");
+        assert!(!grow(true, true), "on: held while application-limited");
+        assert!(grow(true, false), "on: grows when the window limits");
     }
 
     #[test]

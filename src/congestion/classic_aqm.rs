@@ -116,6 +116,11 @@ pub struct ClassicAqmMonitor {
     rest_depth: u64,
     score: u64,
     state: ClassicAqmState,
+    /// Briscoe and Ahmed's self-limitation term (see `set_self_limited`), and the samples and
+    /// application-limited samples since the last scored round.
+    self_limited: bool,
+    round_samples: u32,
+    round_app_limited: u32,
 }
 
 impl Default for ClassicAqmMonitor {
@@ -132,6 +137,9 @@ impl Default for ClassicAqmMonitor {
             rest_depth: INIT_DEPTH_CARRY,
             score: 0,
             state: ClassicAqmState::InsufficientEvidence,
+            self_limited: false,
+            round_samples: 0,
+            round_app_limited: 0,
         }
     }
 }
@@ -158,6 +166,15 @@ impl ClassicAqmMonitor {
     /// Observe one validated recovery extent and score it, as tcp_prague.c
     /// does once per round.  CE is deliberately a gate: RTT variation without
     /// CE cannot prove a Classic ECN AQM is present.
+    /// Lower the score each scored round by the share of that round's samples that were
+    /// application-limited (the design's self-limitation term, which "can only push it
+    /// downwards (less classic)": a self-limited flow's RTT variability is more likely other
+    /// flows', Briscoe and Ahmed, TR-BB-2019-002, arXiv 1911.00710, S3.1.2). tcp_prague.c has
+    /// it commented out as unevaluated. Off by default.
+    pub fn set_self_limited(&mut self, enabled: bool) {
+        self.self_limited = enabled;
+    }
+
     pub fn observe(&mut self, observation: ClassicAqmObservation) -> ClassicAqmAssessment {
         self.observe_sample(observation, true)
     }
@@ -203,6 +220,10 @@ impl ClassicAqmMonitor {
         let latest = micros(observation.latest_rtt);
         if latest == 0 {
             return self.assessment();
+        }
+        self.round_samples = self.round_samples.saturating_add(1);
+        if observation.app_limited {
+            self.round_app_limited = self.round_app_limited.saturating_add(1);
         }
         self.saw_ce |= observation.ce_seen && observation.ce_delta > 0;
         if !observation.is_detector_eligible() {
@@ -297,6 +318,13 @@ impl ClassicAqmMonitor {
                 score += (weighted - D0_LG) as i128;
             }
         }
+        if self.self_limited && self.round_samples > 0 {
+            // - S*s, with s the self-limited share of the round and S = 1.
+            score -= (u128::from(MAX_ALPHA) * u128::from(self.round_app_limited)
+                / u128::from(self.round_samples)) as i128;
+        }
+        self.round_samples = 0;
+        self.round_app_limited = 0;
         self.score = score.clamp(0, C_STICKY as i128) as u64;
         self.state = self.state_for_score();
         self.assessment()
@@ -330,6 +358,16 @@ impl ClassicAqmMonitor {
 
     pub fn state(&self) -> ClassicAqmState {
         self.state
+    }
+
+    /// The slow RTT estimator the score is built on: (srtt µs, mdev µs, srtt gain shift).
+    /// Telemetry, so a run can show why the detector did or did not move.
+    pub fn estimator(&self) -> (u64, u64, u32) {
+        (
+            self.srtt_pace_us >> self.srtt_shift,
+            self.mdev_pace_us >> self.mdev_shift,
+            self.srtt_shift,
+        )
     }
 
     pub fn classic_ecn_score(&self) -> u64 {
@@ -633,6 +671,46 @@ mod tests {
         let (first, _) = per_round(&mut monitor, 80_000, 115, l4s_excess_us);
         assert_eq!(first, None);
         assert_eq!(monitor.alpha_floor(), 0);
+    }
+
+    /// The self-limitation term raises the evidence a half app-limited flow needs: a 3 ms
+    /// sawtooth no longer reads as classic, a 7 ms one (a CoDel-like queue) still does, and
+    /// without app-limited samples it changes nothing.
+    #[test]
+    fn self_limited_term_raises_the_bar_for_app_limited_flows() {
+        // `per_round`'s sawtooth with amplitude `amp_us`; every `app_every`-th sample between
+        // scored rounds is application-limited. Returns the samples in the classic region.
+        let run = |self_limited: bool, amp_us: u64, app_every: u64| {
+            let mut monitor = ClassicAqmMonitor::default();
+            monitor.set_self_limited(self_limited);
+            let mut inside = 0u64;
+            for i in 0..80_000u64 {
+                if i == 300 {
+                    monitor.update_rtt_scaling(115);
+                }
+                let mut observation = sample(0, 0);
+                observation.min_rtt = Duration::from_micros(20_000);
+                observation.latest_rtt = Duration::from_micros(21_000 + amp_us * (i % 800) / 800);
+                observation.ce_delta = u64::from(i.is_multiple_of(50));
+                observation.ce_seen = observation.ce_delta > 0;
+                let state = if i.is_multiple_of(115) {
+                    monitor.observe(observation).state
+                } else {
+                    observation.app_limited = app_every > 0 && i.is_multiple_of(app_every);
+                    monitor.observe_rtt(observation).state
+                };
+                inside += u64::from(state == ClassicAqmState::ClassicCompatible);
+            }
+            inside
+        };
+        assert_eq!(run(true, 3_000, 0), run(false, 3_000, 0));
+        assert!(run(false, 3_000, 2) > 40_000);
+        assert_eq!(run(true, 3_000, 2), 0);
+        let (plain, term) = (run(false, 7_000, 2), run(true, 7_000, 2));
+        assert!(
+            term * 10 > plain * 9,
+            "a deep sawtooth stays classic: {term} against {plain}"
+        );
     }
 
     #[test]
