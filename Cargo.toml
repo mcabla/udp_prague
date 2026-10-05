@@ -1,6 +1,6 @@
 [package]
 name = "udp_prague"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0 AND GPL-2.0-only"
 description = "A Rust implementation of the Prague congestion control protocol for UDP-based applications."

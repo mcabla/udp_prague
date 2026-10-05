@@ -439,8 +439,7 @@ impl AppStuff {
             self.jw.field_i32(
                 "classic_ecn_fallback_active",
                 i32::from(
-                    self.classic_aqm_assessment.state == ClassicAqmState::ClassicCompatible
-                        && self.classic_aqm_assessment.alpha_floor > 0
+                    self.classic_aqm_assessment.alpha_floor > 0
                         && self.classic_aqm_fallback_enabled,
                 ),
             );

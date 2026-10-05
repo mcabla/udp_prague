@@ -9,9 +9,7 @@ use core::cmp;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::classic_aqm::{
-    ClassicAqmAssessment, ClassicAqmMonitor, ClassicAqmObservation, ClassicAqmState,
-};
+use super::classic_aqm::{ClassicAqmAssessment, ClassicAqmMonitor, ClassicAqmObservation};
 
 /// Size in bytes.
 pub type size_tp = u64;
@@ -76,7 +74,7 @@ pub const PRAGUE_MAXRATE: rate_tp = 12_500_000_000;
 
 // Prague consts and methods (ported literally from the C++ reference)
 const MIN_STEP: rate_tp = 7; // Minimally wait for 7 RTTs to try to increase faster
-const RATE_STEP: rate_tp = 1_920_000; // per 1920kB/s pacing rate wait one RTT longer
+const RATE_SHIFT: u32 = 21; // per 2097152 B/s pacing rate wait one RTT longer (>> 21)
 const QUEUE_GROWTH: time_tp = 1_000; // target queue growth of 1000us = 1ms
 const BURST_TIME: time_tp = 250; // 250us
 const REF_RTT: time_tp = 25_000; // 25ms
@@ -85,6 +83,7 @@ const MAX_PROB: prob_tp = 1i64 << PROB_SHIFT;
 const ALPHA_SHIFT: u8 = 4; // >>4 divide by 16
 const MIN_PKT_BURST: count_tp = 1;
 const MIN_PKT_WIN: count_tp = 2;
+const MIN_PACKET_RATE: rate_tp = 80; // 2 packets per 25ms: the minimum packet rate kept by shrinking packets
 const RATE_OFFSET: u8 = 3; // +/-3% for non-RT mode transfer during vrtt halves
 const MIN_FRAME_WIN: count_tp = 2;
 
@@ -339,7 +338,9 @@ pub struct PragueRateAdvice {
     pub classic_ecn_alpha_floor_ppm: u32,
     /// Linux-reference `classic_ecn` score (scaled by 1 << 24).
     pub classic_ecn_score: u64,
-    /// Whether the monitor currently classifies the path as Classic-compatible.
+    /// Whether the Classic-AQM alpha floor currently applies (score above the
+    /// L4S-sticky region, as tcp_prague.c applies it), including its partial
+    /// ramp in `ClassicSuspected`.
     pub classic_ecn_fallback_active: bool,
     /// Whether Prague's independent L4S marking negotiation/error state is active.
     pub l4s_marking_error_active: bool,
@@ -397,8 +398,7 @@ impl PragueRateAdvice {
             effective_alpha_ppm: alpha_to_ppm(effective_alpha),
             classic_ecn_alpha_floor_ppm: alpha_to_ppm(classic.alpha_floor as prob_tp),
             classic_ecn_score: classic.classic_ecn_score,
-            classic_ecn_fallback_active: classic.state == ClassicAqmState::ClassicCompatible
-                && classic.alpha_floor > 0,
+            classic_ecn_fallback_active: classic.alpha_floor > 0,
             l4s_marking_error_active: state.m_error_L4S,
             congestion_signal: congestion_signal_from_state(&state),
             l4s_fallback_active: state.m_error_L4S,
@@ -493,6 +493,8 @@ pub struct PragueCC {
     state: PragueState,
     classic_aqm: ClassicAqmMonitor,
     classic_aqm_fallback_enabled: bool,
+    /// An alpha round ended since the detector last scored.
+    classic_aqm_round_due: bool,
 }
 
 impl Default for PragueCC {
@@ -530,6 +532,7 @@ impl PragueCC {
             },
             classic_aqm: ClassicAqmMonitor::default(),
             classic_aqm_fallback_enabled: true,
+            classic_aqm_round_due: false,
         };
         let ts_now = cc.Now();
 
@@ -601,7 +604,7 @@ impl PragueCC {
         // cc variables
         cc.state.m_cc_state = cs_tp::cs_init;
         cc.state.m_cca_mode = cca_tp::cca_prague_win;
-        cc.state.m_rtts_to_growth = (init_rate / RATE_STEP) as count_tp + (MIN_STEP as count_tp);
+        cc.state.m_rtts_to_growth = (init_rate >> RATE_SHIFT) as count_tp + (MIN_STEP as count_tp);
         cc.state.m_alpha = 0;
         cc.state.m_pacing_rate = init_rate;
         cc.state.m_fractional_window = cc.state.m_init_window;
@@ -654,11 +657,28 @@ impl PragueCC {
         self.classic_aqm_fallback_enabled
     }
 
+    /// Score one observation as a whole round.
     pub fn observe_classic_aqm(
         &mut self,
         observation: ClassicAqmObservation,
     ) -> ClassicAqmAssessment {
         self.classic_aqm.observe(observation)
+    }
+
+    /// Feed the detector every acknowledged RTT sample: it scores once per
+    /// alpha round, as tcp_prague.c does, on the first eligible sample after
+    /// the round ends.  Scoring every ACK instead makes the score a fast
+    /// random walk that a stale RTT baseline drives into the sticky region.
+    pub fn observe_classic_aqm_ack(
+        &mut self,
+        observation: ClassicAqmObservation,
+    ) -> ClassicAqmAssessment {
+        if self.classic_aqm_round_due && observation.is_detector_eligible() {
+            self.classic_aqm_round_due = false;
+            self.classic_aqm.observe(observation)
+        } else {
+            self.classic_aqm.observe_rtt(observation)
+        }
     }
 
     pub fn classic_aqm_assessment(&self) -> ClassicAqmAssessment {
@@ -828,8 +848,9 @@ impl PragueCC {
             self.state.m_cc_state = cs_tp::cs_cong_avoid;
         }
 
-        // below pacing interval or 2ms the RTT is too unstable
-        if srtt <= 2_000 || srtt <= pacing_interval {
+        // below pacing interval or 2ms the RTT is too unstable, but only use the
+        // rate-based update while waiting for growth (after marks or drops)
+        if self.state.m_rtts_to_growth != 0 && (srtt <= 2_000 || srtt <= pacing_interval) {
             self.state.m_cca_mode = cca_tp::cca_prague_rate;
         } else {
             if self.state.m_cca_mode == cca_tp::cca_prague_rate {
@@ -840,6 +861,7 @@ impl PragueCC {
         }
 
         let ts = self.Now();
+        let mut reduced = false;
 
         // Update alpha if both a window and a virtual rtt are passed
         if wrapping_sub_count(
@@ -865,6 +887,7 @@ impl PragueCC {
             self.state.m_alpha_packets_CE = packets_CE;
             self.state.m_alpha_packets_received = packets_received;
             self.state.m_alpha_ts = ts;
+            self.classic_aqm_round_due = true;
             if self.state.m_rtts_to_growth > 0 {
                 self.state.m_rtts_to_growth -= 1;
             }
@@ -944,6 +967,7 @@ impl PragueCC {
             }
 
             self.state.m_cc_state = cs_tp::cs_in_loss;
+            reduced = true;
             self.state.m_loss_cca = self.state.m_cca_mode;
             self.state.m_loss_packets_sent = packets_sent;
             self.state.m_loss_ts = ts;
@@ -1010,7 +1034,7 @@ impl PragueCC {
             && wrapping_sub_count(self.state.m_packets_CE, packets_CE) < 0
         {
             self.state.m_rtts_to_growth =
-                (self.state.m_pacing_rate / RATE_STEP) as count_tp + (MIN_STEP as count_tp);
+                (self.state.m_pacing_rate >> RATE_SHIFT) as count_tp + (MIN_STEP as count_tp);
             let alpha_u64 = self.effective_alpha() as u64;
             if self.state.m_cca_mode == cca_tp::cca_prague_win {
                 self.state.m_fractional_window = self.state.m_fractional_window.wrapping_sub(
@@ -1023,6 +1047,7 @@ impl PragueCC {
             }
 
             self.state.m_cc_state = cs_tp::cs_in_cwr;
+            reduced = true;
             self.state.m_cwr_packets_sent = packets_sent;
             self.state.m_cwr_ts = ts;
         }
@@ -1033,22 +1058,22 @@ impl PragueCC {
         }
         if self.state.m_pacing_rate < self.state.m_min_rate {
             self.state.m_pacing_rate = self.state.m_min_rate;
+            self.state.m_fractional_window = self.state.m_pacing_rate.wrapping_mul(srtt as u64);
         }
         if self.state.m_pacing_rate > self.state.m_max_rate {
             self.state.m_pacing_rate = self.state.m_max_rate;
+            self.state.m_fractional_window = self.state.m_pacing_rate.wrapping_mul(srtt as u64);
         }
-        self.state.m_fractional_window = self.state.m_pacing_rate.wrapping_mul(srtt as u64);
+        // only in rate mode, otherwise the window loses precision every ACK
+        if self.state.m_cca_mode == cca_tp::cca_prague_rate {
+            self.state.m_fractional_window = self.state.m_pacing_rate.wrapping_mul(srtt as u64);
+        }
         if self.state.m_fractional_window == 0 {
             self.state.m_fractional_window = 1;
         }
 
         // determine packet size
-        self.state.m_packet_size = self
-            .state
-            .m_pacing_rate
-            .wrapping_mul(self.state.m_vrtt as u64)
-            / 1_000_000
-            / (MIN_PKT_WIN as u64);
+        self.state.m_packet_size = self.state.m_pacing_rate / MIN_PACKET_RATE;
         if self.state.m_packet_size < PRAGUE_MINMTU {
             self.state.m_packet_size = PRAGUE_MINMTU;
         }
@@ -1072,6 +1097,10 @@ impl PragueCC {
                 + 1) as count_tp;
         if self.state.m_packet_window < MIN_PKT_WIN {
             self.state.m_packet_window = MIN_PKT_WIN;
+        }
+        if reduced {
+            self.classic_aqm
+                .update_rtt_scaling(self.state.m_packet_window as u64);
         }
 
         // remember previous ACK for next ACK
@@ -1120,7 +1149,10 @@ impl PragueCC {
         }
     }
 
-    /// Reset CC state (e.g., after an RTO).
+    /// Reset CC state (e.g., after an RTO).  The Classic-AQM evidence is a
+    /// property of the path, so it is kept, as tcp_prague.c resets
+    /// `classic_ecn` only when a connection starts; a new path gets a new
+    /// controller.
     pub fn ResetCCInfo(&mut self) {
         self.state.m_cc_ts = self.Now();
         self.state.m_cc_state = cs_tp::cs_init;
@@ -1133,9 +1165,9 @@ impl PragueCC {
         self.state.m_packet_size = self.state.m_max_packet_size;
         self.state.m_packet_window = MIN_PKT_WIN;
         self.state.m_rtts_to_growth =
-            (self.state.m_pacing_rate / RATE_STEP) as count_tp + (MIN_STEP as count_tp);
+            (self.state.m_pacing_rate >> RATE_SHIFT) as count_tp + (MIN_STEP as count_tp);
         self.state.m_lost_rtts_to_growth = 0;
-        self.classic_aqm.reset();
+        self.classic_aqm_round_due = false;
     }
 
     /// Get time/ECN information to attach to outgoing packets.
@@ -1275,6 +1307,7 @@ impl PragueCC {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::congestion::classic_aqm::ClassicAqmState;
 
     #[test]
     fn now_skips_zero_and_wraps() {
@@ -1303,10 +1336,10 @@ mod tests {
         // u64::MAX rather than silently wrapping to a small/nonsensical
         // value.
         let cc = PragueCC::new(
-            u16::MAX as size_tp, // max_packet_size
-            0,                   // fps
-            0,                   // frame_budget
-            PRAGUE_INITRATE,     // init_rate
+            u16::MAX as size_tp,  // max_packet_size
+            0,                    // fps
+            0,                    // frame_budget
+            PRAGUE_INITRATE,      // init_rate
             i32::MAX as count_tp, // init_window (Quinn's adapter clamps to this)
             PRAGUE_MINRATE,
             PRAGUE_MAXRATE,
@@ -1512,6 +1545,83 @@ mod tests {
         assert_eq!(cc.state.m_fractional_window, original_window);
     }
 
+    /// Window mode at a 10 ms RTT and 200 kB/s, with an ACK that reports nothing new.
+    fn idle_ack_state() -> PragueCC {
+        let mut cc = PragueCC::default();
+        cc.state.m_cc_state = cs_tp::cs_cong_avoid;
+        cc.state.m_cca_mode = cca_tp::cca_prague_win;
+        cc.state.m_srtt = 10_000;
+        cc.state.m_vrtt = 10_000;
+        cc.state.m_packet_size = 1200;
+        cc.state.m_max_packet_size = 1200;
+        cc.state.m_pacing_rate = 200_000;
+        cc.state.m_fractional_window = 2_000_000_000;
+        cc.state.m_packets_received = 10;
+        cc.state.m_packets_sent = 20;
+        cc
+    }
+
+    #[test]
+    fn rate_mode_only_while_waiting_for_growth() {
+        // Upstream 858afb3: below 2 ms (or the pacing interval) the rate-based
+        // update is used only after marks or drops.
+        let mut cc = idle_ack_state();
+        cc.state.m_srtt = 1_500;
+        cc.state.m_fractional_window = 300_000_000;
+        cc.state.m_rtts_to_growth = 0;
+        let mut inflight = 0;
+        assert!(cc.ACKReceived(10, 0, 0, 20, false, &mut inflight));
+        assert_eq!(cc.state.m_cca_mode, cca_tp::cca_prague_win);
+
+        cc.state.m_rtts_to_growth = 3;
+        assert!(cc.ACKReceived(10, 0, 0, 20, false, &mut inflight));
+        assert_eq!(cc.state.m_cca_mode, cca_tp::cca_prague_rate);
+    }
+
+    #[test]
+    fn window_mode_keeps_the_window_precise() {
+        // Upstream 858afb3: W = rate * srtt only in rate mode or when clamped.
+        let mut cc = idle_ack_state();
+        cc.state.m_fractional_window = 2_000_000_123;
+        let mut inflight = 0;
+        assert!(cc.ACKReceived(10, 0, 0, 20, false, &mut inflight));
+        assert_eq!(cc.state.m_fractional_window, 2_000_000_123);
+        assert_eq!(cc.state.m_pacing_rate, 200_000);
+    }
+
+    #[test]
+    fn packet_size_follows_the_minimum_packet_rate() {
+        // Upstream e86b01a: rate / 80 packets/s, within [PRAGUE_MINMTU, max].
+        let mut cc = idle_ack_state();
+        cc.state.m_fractional_window = 48_000 * 10_000;
+        let mut inflight = 0;
+        assert!(cc.ACKReceived(10, 0, 0, 20, false, &mut inflight));
+        assert_eq!(cc.state.m_pacing_rate, 48_000);
+        assert_eq!(cc.state.m_packet_size, 600);
+    }
+
+    #[test]
+    fn rtts_to_growth_uses_the_reference_shift() {
+        // Upstream 9f9232f: (rate >> 21) + MIN_STEP.
+        let mut cc = PragueCC::default();
+        cc.state.m_pacing_rate = 12_500_000;
+        cc.ResetCCInfo();
+        assert_eq!(
+            cc.state.m_rtts_to_growth,
+            (cc.state.m_init_rate >> 21) as count_tp + 7
+        );
+        let cc = PragueCC::new(
+            1400,
+            0,
+            0,
+            12_500_000,
+            PRAGUE_INITWIN,
+            PRAGUE_MINRATE,
+            PRAGUE_MAXRATE,
+        );
+        assert_eq!(cc.state.m_rtts_to_growth, 5 + 7);
+    }
+
     #[test]
     fn reset_cc_info_restores_initial_runtime_bounds() {
         let mut cc = PragueCC::default();
@@ -1540,7 +1650,7 @@ mod tests {
         assert_eq!(cc.state.m_lost_rtts_to_growth, 0);
         assert_eq!(
             cc.state.m_rtts_to_growth,
-            (cc.state.m_pacing_rate / RATE_STEP) as count_tp + (MIN_STEP as count_tp)
+            (cc.state.m_pacing_rate >> RATE_SHIFT) as count_tp + (MIN_STEP as count_tp)
         );
     }
 
@@ -1560,6 +1670,91 @@ mod tests {
         cc.set_max_packet_size(0);
         assert_eq!(cc.state.m_max_packet_size, 1);
         assert_eq!(cc.state.m_packet_size, 1);
+    }
+
+    #[test]
+    fn classic_aqm_ack_scores_once_per_alpha_round() {
+        let mut cc = PragueCC::default();
+        let classic = |i: u64| ClassicAqmObservation {
+            latest_rtt: std::time::Duration::from_millis(if i.is_multiple_of(2) { 1 } else { 500 }),
+            min_rtt: std::time::Duration::from_millis(1),
+            ce_seen: true,
+            ce_delta: 1,
+            acked_delta: 10,
+            congestion_avoidance_stable: true,
+            ..Default::default()
+        };
+        for i in 0..20_000 {
+            cc.observe_classic_aqm_ack(classic(i));
+        }
+        assert_eq!(cc.classic_aqm_assessment().classic_ecn_score, 0);
+
+        cc.classic_aqm_round_due = true;
+        let mut idle = classic(0);
+        idle.app_limited = true;
+        cc.observe_classic_aqm_ack(idle);
+        assert!(
+            cc.classic_aqm_round_due,
+            "an ineligible sample does not take the round"
+        );
+        cc.observe_classic_aqm_ack(classic(1));
+        assert!(!cc.classic_aqm_round_due);
+    }
+
+    #[test]
+    fn reset_cc_info_keeps_classic_aqm_evidence() {
+        let mut cc = PragueCC::default();
+        for i in 0..20_000u64 {
+            cc.observe_classic_aqm(ClassicAqmObservation {
+                latest_rtt: std::time::Duration::from_millis(if i.is_multiple_of(2) {
+                    1
+                } else {
+                    500
+                }),
+                min_rtt: std::time::Duration::from_millis(1),
+                ce_seen: true,
+                ce_delta: 1,
+                acked_delta: 10,
+                congestion_avoidance_stable: true,
+                ..Default::default()
+            });
+        }
+        let before = cc.classic_aqm_assessment();
+        assert!(before.alpha_floor > 0);
+        cc.ResetCCInfo();
+        assert_eq!(cc.classic_aqm_assessment(), before);
+        assert!(cc.bulk_advice().classic_ecn_fallback_active);
+    }
+
+    #[test]
+    fn fallback_is_active_as_soon_as_the_floor_applies() {
+        let mut cc = PragueCC::default();
+        let mut i = 0u64;
+        while cc.classic_aqm_assessment().alpha_floor == 0 {
+            cc.observe_classic_aqm(ClassicAqmObservation {
+                latest_rtt: std::time::Duration::from_millis(if i.is_multiple_of(2) {
+                    1
+                } else {
+                    500
+                }),
+                min_rtt: std::time::Duration::from_millis(1),
+                ce_seen: true,
+                ce_delta: 1,
+                acked_delta: 10,
+                congestion_avoidance_stable: true,
+                ..Default::default()
+            });
+            i += 1;
+            assert!(i < 20_000, "the floor never applied");
+        }
+        // The floor ramps in before the state reaches ClassicCompatible.
+        assert_eq!(
+            cc.classic_aqm_assessment().state,
+            ClassicAqmState::ClassicSuspected
+        );
+        assert!(cc.bulk_advice().classic_ecn_fallback_active);
+        cc.set_classic_aqm_fallback_enabled(false);
+        assert!(!cc.bulk_advice().classic_ecn_fallback_active);
     }
 
     #[test]

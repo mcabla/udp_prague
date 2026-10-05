@@ -62,7 +62,7 @@ fn observe_classic_aqm_feedback(
         *min_rtt_us = state.m_rtt;
     }
 
-    let assessment = cc.observe_classic_aqm(ClassicAqmObservation {
+    let assessment = cc.observe_classic_aqm_ack(ClassicAqmObservation {
         latest_rtt: Duration::from_micros(state.m_rtt as u64),
         min_rtt: Duration::from_micros((*min_rtt_us).max(1) as u64),
         ce_seen: ce_delta > 0,

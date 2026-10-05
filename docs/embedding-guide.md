@@ -55,7 +55,10 @@ embedded by native UDP or QUIC adapters. Feed it only validated, direction-
 matched recovery observations. CE is a required evidence gate; RTT variation
 alone cannot classify a path, and app-limited/unstable samples do not advance
 strong evidence. The monitor maintains the Linux Prague slow RTT/MDEV
-residuals in fixed-point arithmetic, exposes `InsufficientEvidence`,
+residuals in fixed-point arithmetic and, like Linux, scales the estimator's
+gain to the window (`update_rtt_scaling`) and scores once per round: a
+per-ACK caller feeds every sample through `PragueCC::observe_classic_aqm_ack`,
+which scores on the first eligible sample after each alpha round. It exposes `InsufficientEvidence`,
 `L4sLikely`, `ClassicSuspected`, and `ClassicCompatible` states with sticky
 hysteresis, and resets on a genuinely new path. The source provenance is
 L4STeam/linux `testing`, revision
