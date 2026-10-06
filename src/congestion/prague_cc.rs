@@ -1157,11 +1157,16 @@ impl PragueCC {
             self.state.m_packet_burst = MIN_PKT_BURST;
         }
 
-        // packet window: allow 3% higher pacing rate and round up
-        self.state.m_packet_window =
-            (((self.state.m_fractional_window * (100 + RATE_OFFSET as u64)) / 100_000_000)
-                / cmp::max(self.state.m_packet_size, 1)
-                + 1) as count_tp;
+        // packet window: allow 3% higher pacing rate and round up; saturate rather than overflow
+        // for an outsized fractional window, and clamp to the count type
+        let packet_window = (self
+            .state
+            .m_fractional_window
+            .saturating_mul(100 + RATE_OFFSET as u64)
+            / 100_000_000)
+            / cmp::max(self.state.m_packet_size, 1)
+            + 1;
+        self.state.m_packet_window = packet_window.min(count_tp::MAX as u64) as count_tp;
         if self.state.m_packet_window < MIN_PKT_WIN {
             self.state.m_packet_window = MIN_PKT_WIN;
         }
@@ -1654,6 +1659,20 @@ mod tests {
         assert!(cc.ACKReceived(10, 0, 0, 20, false, &mut inflight));
         assert_eq!(cc.state.m_fractional_window, 2_000_000_123);
         assert_eq!(cc.state.m_pacing_rate, 200_000);
+    }
+
+    #[test]
+    fn packet_window_saturates_for_a_huge_fractional_window() {
+        // A fractional window near u64::MAX (a saturated initial window, or rate * srtt with an
+        // outsized RTT sample) must not overflow the packet-window arithmetic.
+        let mut cc = idle_ack_state();
+        cc.state.m_max_rate = rate_tp::MAX;
+        cc.state.m_fractional_window = u64::MAX / 2;
+        let mut inflight = 0;
+        assert!(cc.ACKReceived(10, 0, 0, 20, false, &mut inflight));
+        // The window times 103 saturates at u64::MAX, then is scaled down as before.
+        let expected = (u64::MAX / 100_000_000) / cc.state.m_packet_size + 1;
+        assert_eq!(cc.state.m_packet_window as u64, expected);
     }
 
     #[test]
