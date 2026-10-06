@@ -32,6 +32,8 @@ use std::time::Duration;
 
 const ALPHA_BITS: u32 = 24;
 const MAX_ALPHA: u64 = 1 << ALPHA_BITS;
+// Upper bounds of the RTT estimator's gain shifts (`PRAGUE_MAX_SRTT_BITS`,
+// `PRAGUE_MAX_MDEV_BITS`); `update_rtt_scaling` lowers them with the window.
 const SRTT_SHIFT: u32 = 18;
 const MDEV_SHIFT: u32 = 19;
 const INIT_ADJ_US: u64 = 1 << 18;
@@ -81,6 +83,14 @@ pub struct ClassicAqmObservation {
     pub detector_eligible: Option<bool>,
 }
 
+impl ClassicAqmObservation {
+    /// Whether this sample may update the detector.
+    pub fn is_detector_eligible(&self) -> bool {
+        self.detector_eligible
+            .unwrap_or(!self.app_limited && self.congestion_avoidance_stable)
+    }
+}
+
 /// Cheap, serializable result of the monitor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClassicAqmAssessment {
@@ -98,12 +108,19 @@ pub struct ClassicAqmMonitor {
     initialized: bool,
     saw_ce: bool,
     stable_samples: u32,
+    srtt_shift: u32,
+    mdev_shift: u32,
     srtt_pace_us: u64,
     mdev_pace_us: u64,
     rest_mdev: u64,
     rest_depth: u64,
     score: u64,
     state: ClassicAqmState,
+    /// Briscoe and Ahmed's self-limitation term (see `set_self_limited`), and the samples and
+    /// application-limited samples since the last scored round.
+    self_limited: bool,
+    round_samples: u32,
+    round_app_limited: u32,
 }
 
 impl Default for ClassicAqmMonitor {
@@ -112,12 +129,17 @@ impl Default for ClassicAqmMonitor {
             initialized: false,
             saw_ce: false,
             stable_samples: 0,
+            srtt_shift: SRTT_SHIFT,
+            mdev_shift: MDEV_SHIFT,
             srtt_pace_us: 0,
             mdev_pace_us: 0,
             rest_mdev: INIT_MDEV_CARRY,
             rest_depth: INIT_DEPTH_CARRY,
             score: 0,
             state: ClassicAqmState::InsufficientEvidence,
+            self_limited: false,
+            round_samples: 0,
+            round_app_limited: 0,
         }
     }
 }
@@ -141,22 +163,76 @@ impl ClassicAqmMonitor {
         *self = Self::default();
     }
 
-    /// Observe one validated recovery extent.  CE is deliberately a gate:
-    /// RTT variation without CE cannot prove a Classic ECN AQM is present.
+    /// Observe one validated recovery extent and score it, as tcp_prague.c
+    /// does once per round.  CE is deliberately a gate: RTT variation without
+    /// CE cannot prove a Classic ECN AQM is present.
+    /// Lower the score each scored round by the share of that round's samples that were
+    /// application-limited (the design's self-limitation term, which "can only push it
+    /// downwards (less classic)": a self-limited flow's RTT variability is more likely other
+    /// flows', Briscoe and Ahmed, TR-BB-2019-002, arXiv 1911.00710, S3.1.2). tcp_prague.c has
+    /// it commented out as unevaluated. Off by default.
+    pub fn set_self_limited(&mut self, enabled: bool) {
+        self.self_limited = enabled;
+    }
+
     pub fn observe(&mut self, observation: ClassicAqmObservation) -> ClassicAqmAssessment {
+        self.observe_sample(observation, true)
+    }
+
+    /// Feed one RTT sample to the slow RTT/MDEV estimator without scoring it
+    /// (tcp_prague.c's per-ACK `prague_rtt_estimator`).  Callers that see
+    /// every ACK score once per round with [`Self::observe`] and pass the
+    /// other samples here.
+    pub fn observe_rtt(&mut self, observation: ClassicAqmObservation) -> ClassicAqmAssessment {
+        self.observe_sample(observation, false)
+    }
+
+    /// Scale the estimator's gain to the window (in packets) after a window
+    /// reduction, as `prague_update_rtt_scaling` does with ssthresh: a gain of
+    /// 1/2^18 per sample would keep an early outlier in the baseline for
+    /// minutes at a few thousand samples per second.
+    pub fn update_rtt_scaling(&mut self, window_packets: u64) {
+        let lg = ilog2(window_packets.max(1));
+        let shift = (lg + (lg >> 1) + 1).min(SRTT_SHIFT);
+        let old = self.srtt_shift;
+        self.srtt_shift = shift;
+        self.mdev_shift = shift + 1;
+        if shift > old {
+            let d = shift - old;
+            self.srtt_pace_us = self.srtt_pace_us.saturating_mul(1 << d);
+            self.mdev_pace_us = self.mdev_pace_us.saturating_mul(1 << d);
+            self.rest_depth = self.rest_depth.saturating_mul(1 << d);
+            self.rest_mdev = self.rest_mdev.saturating_mul(1 << d);
+        } else if shift < old {
+            let d = old - shift;
+            self.srtt_pace_us >>= d;
+            self.mdev_pace_us >>= d;
+            self.rest_depth = (self.rest_depth >> d).max(1);
+            self.rest_mdev = (self.rest_mdev >> d).max(1);
+        }
+    }
+
+    fn observe_sample(
+        &mut self,
+        observation: ClassicAqmObservation,
+        score_round: bool,
+    ) -> ClassicAqmAssessment {
         let latest = micros(observation.latest_rtt);
         if latest == 0 {
             return self.assessment();
         }
+        self.round_samples = self.round_samples.saturating_add(1);
+        if observation.app_limited {
+            self.round_app_limited = self.round_app_limited.saturating_add(1);
+        }
         self.saw_ce |= observation.ce_seen && observation.ce_delta > 0;
-        let detector_eligible = observation
-            .detector_eligible
-            .unwrap_or(!observation.app_limited && observation.congestion_avoidance_stable);
-        if !detector_eligible {
+        if !observation.is_detector_eligible() {
             // Start a fresh eligible warm-up after an application-limited or
             // unstable epoch. The independent path baseline remains owned by
             // Quinn; this detector does not manufacture capacity-seeking load.
-            self.stable_samples = 0;
+            if score_round {
+                self.stable_samples = 0;
+            }
             if self.saw_ce {
                 self.state = if self.score == 0 {
                     ClassicAqmState::L4sLikely
@@ -166,12 +242,20 @@ impl ClassicAqmMonitor {
             }
             return self.assessment();
         }
+        let min_rtt = micros(observation.min_rtt);
         if !self.initialized {
+            // Seed at the path's minimum, like tcp_prague.c seeds at the
+            // handshake RTT: the first eligible sample can be a burst's.
+            let seed = if min_rtt > 0 && min_rtt < latest {
+                min_rtt
+            } else {
+                latest
+            };
             self.initialized = true;
-            self.srtt_pace_us = latest.saturating_mul(1u64 << SRTT_SHIFT);
-            self.mdev_pace_us = 1 << MDEV_SHIFT;
+            self.srtt_pace_us = seed.saturating_mul(1u64 << self.srtt_shift);
+            self.mdev_pace_us = 1 << self.mdev_shift;
         } else {
-            let srtt = self.srtt_pace_us >> SRTT_SHIFT;
+            let srtt = self.srtt_pace_us >> self.srtt_shift;
             let error = latest as i128 - srtt as i128;
             self.srtt_pace_us = if error >= 0 {
                 self.srtt_pace_us.saturating_add(error as u64)
@@ -179,7 +263,7 @@ impl ClassicAqmMonitor {
                 self.srtt_pace_us.saturating_sub((-error) as u64)
             };
             let delta = srtt.abs_diff(latest);
-            let mdev = self.mdev_pace_us >> MDEV_SHIFT;
+            let mdev = self.mdev_pace_us >> self.mdev_shift;
             let error = delta as i128 - mdev as i128;
             self.mdev_pace_us = if error >= 0 {
                 self.mdev_pace_us.saturating_add(error as u64)
@@ -190,6 +274,12 @@ impl ClassicAqmMonitor {
 
         if !self.saw_ce {
             self.state = ClassicAqmState::InsufficientEvidence;
+            return self.assessment();
+        }
+        if !score_round {
+            if self.state == ClassicAqmState::InsufficientEvidence {
+                self.state = self.state_for_score();
+            }
             return self.assessment();
         }
         // A CE extent without newly acknowledged packets is not a usable
@@ -207,27 +297,34 @@ impl ClassicAqmMonitor {
 
         // Keep the same fixed-point shape as tcp_prague.c: the geometric
         // residual is carried between rounds and the logarithm is integer-only.
-        let mdev = (self.mdev_pace_us >> MDEV_SHIFT)
+        let adj = INIT_ADJ_US >> (MDEV_SHIFT - self.mdev_shift);
+        let mdev = (self.mdev_pace_us >> self.mdev_shift)
             .saturating_mul(self.rest_mdev)
-            .saturating_add(INIT_ADJ_US);
-        let mdev_lg = ilog2(mdev).max(MDEV_SHIFT) - MDEV_SHIFT;
+            .saturating_add(adj);
+        let mdev_lg = ilog2(mdev).max(self.mdev_shift) - self.mdev_shift;
         self.rest_mdev = (mdev >> mdev_lg).max(1);
         let mut score = self.score as i128;
         score += ((u64::from(mdev_lg)) << (ALPHA_BITS - V)) as i128 - V0_LG as i128;
 
-        let min_rtt = micros(observation.min_rtt);
-        let srtt = self.srtt_pace_us >> SRTT_SHIFT;
+        let srtt = self.srtt_pace_us >> self.srtt_shift;
         if min_rtt > 0 && srtt > min_rtt {
             let depth = (srtt - min_rtt)
                 .saturating_mul(self.rest_depth)
-                .saturating_add(INIT_ADJ_US / 2);
-            let depth_lg = ilog2(depth).max(SRTT_SHIFT) - SRTT_SHIFT;
+                .saturating_add(adj / 2);
+            let depth_lg = ilog2(depth).max(self.srtt_shift) - self.srtt_shift;
             self.rest_depth = (depth >> depth_lg).max(1);
             let weighted = (u64::from(depth_lg)) << (ALPHA_BITS - D);
             if weighted > D0_LG {
                 score += (weighted - D0_LG) as i128;
             }
         }
+        if self.self_limited && self.round_samples > 0 {
+            // - S*s, with s the self-limited share of the round and S = 1.
+            score -= (u128::from(MAX_ALPHA) * u128::from(self.round_app_limited)
+                / u128::from(self.round_samples)) as i128;
+        }
+        self.round_samples = 0;
+        self.round_app_limited = 0;
         self.score = score.clamp(0, C_STICKY as i128) as u64;
         self.state = self.state_for_score();
         self.assessment()
@@ -261,6 +358,16 @@ impl ClassicAqmMonitor {
 
     pub fn state(&self) -> ClassicAqmState {
         self.state
+    }
+
+    /// The slow RTT estimator the score is built on: (srtt µs, mdev µs, srtt gain shift).
+    /// Telemetry, so a run can show why the detector did or did not move.
+    pub fn estimator(&self) -> (u64, u64, u32) {
+        (
+            self.srtt_pace_us >> self.srtt_shift,
+            self.mdev_pace_us >> self.mdev_shift,
+            self.srtt_shift,
+        )
     }
 
     pub fn classic_ecn_score(&self) -> u64 {
@@ -501,6 +608,142 @@ mod tests {
         assert!(monitor.classic_ecn_score() > 0);
         monitor.reset();
         assert_eq!(monitor.assessment(), ClassicAqmAssessment::default());
+    }
+
+    /// Deterministic stand-in for RTT samples on an L4S DualPI2 path: mostly
+    /// within 1 ms of the minimum, one in twenty 1-3 ms above it.
+    fn l4s_excess_us(i: u64) -> u64 {
+        let r = i
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407)
+            >> 33;
+        if r.is_multiple_of(20) {
+            1_000 + r % 2_000
+        } else {
+            r % 1_000
+        }
+    }
+
+    /// Feeds `acks` samples the way a per-ACK caller does: every sample
+    /// updates the estimator, one per `window` is scored, and the gain is
+    /// scaled to the window after the first reduction.  Returns the first ACK
+    /// in `ClassicCompatible` and how many ACKs were spent there.
+    fn per_round(
+        monitor: &mut ClassicAqmMonitor,
+        acks: u64,
+        window: u64,
+        excess_us: impl Fn(u64) -> u64,
+    ) -> (Option<u64>, u64) {
+        let (mut first, mut inside) = (None, 0);
+        for i in 0..acks {
+            if i == 300 {
+                monitor.update_rtt_scaling(window);
+            }
+            let mut observation = sample(0, 0);
+            observation.min_rtt = Duration::from_micros(20_000);
+            observation.latest_rtt = Duration::from_micros(20_000 + excess_us(i));
+            observation.ce_delta = u64::from(i.is_multiple_of(50));
+            observation.ce_seen = observation.ce_delta > 0;
+            let state = if i.is_multiple_of(window) {
+                monitor.observe(observation).state
+            } else {
+                monitor.observe_rtt(observation).state
+            };
+            if state == ClassicAqmState::ClassicCompatible {
+                first.get_or_insert(i);
+                inside += 1;
+            }
+        }
+        (first, inside)
+    }
+
+    #[test]
+    fn high_first_sample_does_not_pin_classic_fallback() {
+        // The first eligible sample came from a burst 10 ms above the floor.
+        // Seeded from it at a 1/2^18 gain, per-ACK scoring reached the
+        // sticky classic region after ~10k ACKs and stayed there on a flat
+        // L4S path.
+        let mut monitor = ClassicAqmMonitor::default();
+        let mut burst = sample(30, 20);
+        burst.ce_seen = false;
+        burst.ce_delta = 0;
+        monitor.observe_rtt(burst);
+        let (first, _) = per_round(&mut monitor, 80_000, 115, l4s_excess_us);
+        assert_eq!(first, None);
+        assert_eq!(monitor.alpha_floor(), 0);
+    }
+
+    /// The self-limitation term raises the evidence a half app-limited flow needs: a 3 ms
+    /// sawtooth no longer reads as classic, a 7 ms one (a CoDel-like queue) still does, and
+    /// without app-limited samples it changes nothing.
+    #[test]
+    fn self_limited_term_raises_the_bar_for_app_limited_flows() {
+        // `per_round`'s sawtooth with amplitude `amp_us`; every `app_every`-th sample between
+        // scored rounds is application-limited. Returns the samples in the classic region.
+        let run = |self_limited: bool, amp_us: u64, app_every: u64| {
+            let mut monitor = ClassicAqmMonitor::default();
+            monitor.set_self_limited(self_limited);
+            let mut inside = 0u64;
+            for i in 0..80_000u64 {
+                if i == 300 {
+                    monitor.update_rtt_scaling(115);
+                }
+                let mut observation = sample(0, 0);
+                observation.min_rtt = Duration::from_micros(20_000);
+                observation.latest_rtt = Duration::from_micros(21_000 + amp_us * (i % 800) / 800);
+                observation.ce_delta = u64::from(i.is_multiple_of(50));
+                observation.ce_seen = observation.ce_delta > 0;
+                let state = if i.is_multiple_of(115) {
+                    monitor.observe(observation).state
+                } else {
+                    observation.app_limited = app_every > 0 && i.is_multiple_of(app_every);
+                    monitor.observe_rtt(observation).state
+                };
+                inside += u64::from(state == ClassicAqmState::ClassicCompatible);
+            }
+            inside
+        };
+        assert_eq!(run(true, 3_000, 0), run(false, 3_000, 0));
+        assert!(run(false, 3_000, 2) > 40_000);
+        assert_eq!(run(true, 3_000, 2), 0);
+        let (plain, term) = (run(false, 7_000, 2), run(true, 7_000, 2));
+        assert!(
+            term * 10 > plain * 9,
+            "a deep sawtooth stays classic: {term} against {plain}"
+        );
+    }
+
+    #[test]
+    fn classic_sawtooth_is_detected_within_seconds() {
+        // A single-queue Classic ECN AQM: the queue ramps 1 -> 8 ms and drains.
+        let mut monitor = ClassicAqmMonitor::default();
+        let (first, inside) = per_round(&mut monitor, 80_000, 115, |i| {
+            1_000 + 7_000 * (i % 800) / 800
+        });
+        assert!(first.is_some_and(|ack| ack < 6_500), "{first:?}");
+        assert!(inside > 72_000, "{inside}");
+    }
+
+    #[test]
+    fn rtt_scaling_keeps_the_estimates() {
+        let mut monitor = ClassicAqmMonitor::default();
+        for i in 0..1_000 {
+            monitor.observe_rtt(sample(20 + i % 3, 20));
+        }
+        let (srtt, mdev) = (
+            monitor.srtt_pace_us >> monitor.srtt_shift,
+            monitor.mdev_pace_us >> monitor.mdev_shift,
+        );
+        monitor.update_rtt_scaling(115);
+        assert_eq!((monitor.srtt_shift, monitor.mdev_shift), (10, 11));
+        assert_eq!(monitor.srtt_pace_us >> monitor.srtt_shift, srtt);
+        assert_eq!(monitor.mdev_pace_us >> monitor.mdev_shift, mdev);
+        monitor.update_rtt_scaling(u64::MAX);
+        assert_eq!(
+            (monitor.srtt_shift, monitor.mdev_shift),
+            (SRTT_SHIFT, MDEV_SHIFT)
+        );
+        assert_eq!(monitor.srtt_pace_us >> monitor.srtt_shift, srtt);
     }
 
     #[test]

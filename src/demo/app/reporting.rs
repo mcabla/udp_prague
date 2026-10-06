@@ -168,10 +168,12 @@ impl AppStuff {
             self.acc_bytes_sent = self.acc_bytes_sent.saturating_add(event.packet_size);
             for chunk in event
                 .report
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .take(event.num_reports as usize)
             {
-                let report = u16::from_be_bytes([chunk[0], chunk[1]]);
+                let report = u16::from_be_bytes(*chunk);
                 if ((report & 0x8000) >> 15) != 0 {
                     self.acc_rtts = self
                         .acc_rtts
@@ -439,8 +441,7 @@ impl AppStuff {
             self.jw.field_i32(
                 "classic_ecn_fallback_active",
                 i32::from(
-                    self.classic_aqm_assessment.state == ClassicAqmState::ClassicCompatible
-                        && self.classic_aqm_assessment.alpha_floor > 0
+                    self.classic_aqm_assessment.alpha_floor > 0
                         && self.classic_aqm_fallback_enabled,
                 ),
             );

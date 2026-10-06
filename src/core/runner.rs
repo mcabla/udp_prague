@@ -62,7 +62,7 @@ fn observe_classic_aqm_feedback(
         *min_rtt_us = state.m_rtt;
     }
 
-    let assessment = cc.observe_classic_aqm(ClassicAqmObservation {
+    let assessment = cc.observe_classic_aqm_ack(ClassicAqmObservation {
         latest_rtt: Duration::from_micros(state.m_rtt as u64),
         min_rtt: Duration::from_micros((*min_rtt_us).max(1) as u64),
         ce_seen: ce_delta > 0,
@@ -374,8 +374,8 @@ pub fn run_sender_with_reporter(
     let mut receivebuffer = [0u8; BUFFER_SIZE];
     let mut sendbuffer = [0u8; BUFFER_SIZE];
     // Dummy payload.
-    for (i, chunk) in sendbuffer.chunks_exact_mut(4).enumerate() {
-        chunk.copy_from_slice(&(i as u32).to_be_bytes());
+    for (i, chunk) in sendbuffer.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        *chunk = (i as u32).to_be_bytes();
     }
 
     let mut sendtime: [time_tp; PKT_BUFFER_SIZE] = [0; PKT_BUFFER_SIZE];

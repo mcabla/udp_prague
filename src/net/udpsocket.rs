@@ -1585,8 +1585,7 @@ mod win {
     use core::ffi::c_void;
     use core::mem::{self, MaybeUninit};
     use core::ptr;
-    use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-    use std::sync::{Once, OnceLock};
+    use std::sync::OnceLock;
 
     pub type SOCKET = usize;
     pub type socklen_t = i32;
@@ -1831,35 +1830,24 @@ mod win {
         }
     }
 
-    static WSA_INIT_ONCE: Once = Once::new();
-    static WSA_USERS: AtomicUsize = AtomicUsize::new(0);
-    static WSA_STARTUP_RC: AtomicI32 = AtomicI32::new(i32::MIN);
-
-    /// Ensure Winsock is initialized once per process, with a lightweight refcount.
+    /// Initialize Winsock for one socket. Winsock counts `WSAStartup` calls itself and stays
+    /// initialized until each has its `WSACleanup`, so every acquire starts it and every release
+    /// cleans up once: a socket created after another was dropped still finds Winsock running.
     pub fn winsock_acquire() -> Result<(), UdpSocketError> {
-        WSA_INIT_ONCE.call_once(|| {
-            let mut data = MaybeUninit::<WSADATA>::uninit();
-            let rc = unsafe { WSAStartup(0x0202u16, data.as_mut_ptr()) };
-            WSA_STARTUP_RC.store(rc, Ordering::Release);
-        });
-
-        let rc = WSA_STARTUP_RC.load(Ordering::Acquire);
+        let mut data = MaybeUninit::<WSADATA>::uninit();
+        let rc = unsafe { WSAStartup(0x0202u16, data.as_mut_ptr()) };
         if rc != 0 {
             return Err(UdpSocketError::Syscall {
                 call: "WSAStartup",
                 code: rc,
             });
         }
-
-        WSA_USERS.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Decrement Winsock users and call `WSACleanup` when the last socket drops.
+    /// Balance one successful `winsock_acquire`.
     pub fn winsock_release() {
-        if WSA_USERS.fetch_sub(1, Ordering::AcqRel) == 1 {
-            unsafe { WSACleanup() };
-        }
+        unsafe { WSACleanup() };
     }
 
     #[inline]

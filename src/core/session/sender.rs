@@ -353,7 +353,7 @@ impl PragueSenderSession {
                 if self.min_rtt_us <= 0 || state.m_rtt < self.min_rtt_us {
                     self.min_rtt_us = state.m_rtt;
                 }
-                self.cc.observe_classic_aqm(ClassicAqmObservation {
+                self.cc.observe_classic_aqm_ack(ClassicAqmObservation {
                     latest_rtt: std::time::Duration::from_micros(state.m_rtt as u64),
                     min_rtt: std::time::Duration::from_micros(self.min_rtt_us as u64),
                     ce_seen: ce_delta > 0,
